@@ -1,0 +1,24 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "cppdbg",
+      "request": "launch",
+      "args": [],
+      "stopAtEntry": false,
+      "externalConsole": true,
+      "cwd": "c:/Users/aayus/AppData/Local/Temp/431e0bea-9182-4b2b-87aa-4675138459cb_dbengine-scaffold.zip.9cb/dbengine/src/index",
+      "program": "c:/Users/aayus/AppData/Local/Temp/431e0bea-9182-4b2b-87aa-4675138459cb_dbengine-scaffold.zip.9cb/dbengine/src/index/build/Debug/outDebug",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "setupCommands": [
+        {
+          "description": "Enable pretty-printing for gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+build/
+*.db
+*.log
+*.o
+Database Internals.pdf
