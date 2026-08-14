@@ -213,9 +213,9 @@ yet — the field exists in the stub but stays unused until Phase 2):
   verify `Search` matches an in-memory `std::map` used as an oracle.
 
 ### 4.5 Definition of done
-- [ ] Insert/Search work for at least 3 levels of tree depth.
-- [ ] Root-split (tree grows a new level) is tested explicitly.
-- [ ] An oracle test against `std::map` passes for 10k+ random operations.
+- [x] Insert/Search work for at least 3 levels of tree depth.
+- [x] Root-split (tree grows a new level) is tested explicitly.
+- [x] An oracle test against `std::map` passes for 10k+ random operations.
 
 ---
 
@@ -286,9 +286,9 @@ class SlottedPage {
   `VerifyChecksum()` catches it.
 
 ### 5.6 Definition of done
-- [ ] Leaf and internal cell encode/decode round-trip exactly.
-- [ ] A full page correctly rejects further inserts instead of overflowing.
-- [ ] Checksum verification catches single-byte corruption reliably.
+- [x] Leaf and internal cell encode/decode round-trip exactly.
+- [x] A full page correctly rejects further inserts instead of overflowing.
+- [x] Checksum verification catches single-byte corruption reliably.
 
 ---
 

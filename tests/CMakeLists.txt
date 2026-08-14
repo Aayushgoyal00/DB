@@ -9,3 +9,7 @@ add_test(NAME DiskManagerTest COMMAND test_disk_manager)
 add_executable(test_bplus_tree test_bplus_tree.cpp)
 target_link_libraries(test_bplus_tree PRIVATE dbengine_core)
 add_test(NAME BPlusTreeTest COMMAND test_bplus_tree)
+
+add_executable(test_slotted_page test_slotted_page.cpp)
+target_link_libraries(test_slotted_page PRIVATE dbengine_core)
+add_test(NAME SlottedPageTest COMMAND test_slotted_page)

@@ -14,6 +14,7 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 # so both the CLI and the test binaries link against the same code.
 add_library(dbengine_core
   src/storage/disk_manager.cpp
+  src/storage/slotted_page.cpp
   src/index/bplus_tree_engine.cpp
 )
 target_include_directories(dbengine_core PUBLIC include)

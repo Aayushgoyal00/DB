@@ -7,9 +7,10 @@ design rationale, data structures, and API contracts live in
 
 ## Status
 
-Phase 0 skeleton: `DiskManager` (page-level file I/O) is implemented and
-tested. `BPlusTreeEngine` is stubbed against the `KVStore` interface but not
-yet implemented — see `ARCHITECTURE.md` section 4 for what goes in it next.
+Phase 1 complete: the in-memory `BPlusTreeEngine` supports split-propagating
+inserts, lookups, scans, and non-rebalancing deletes; `SlottedPage` provides
+the fixed binary page header, variable-size cell directory, cell codecs, and
+CRC-32 verification needed before the tree becomes page-backed in Phase 2.
 
 ## Build
 
