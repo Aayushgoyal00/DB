@@ -1,5 +1,33 @@
+# local build outputs
 build/
-*.db
-*.log
+build-gcc/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+Makefile
+
+# compiled binaries / object files
+*.exe
+*.dll
+*.lib
+*.obj
 *.o
+*.a
+*.so
+*.out
+*.pdb
+*.ilk
+*.exp
+
+# database and runtime files
+*.db
+dbengine.db
+*.log
+
+# editor / IDE state
+.vscode/
+.idea/
+
+# project-specific downloaded doc
 Database Internals.pdf
