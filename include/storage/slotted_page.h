@@ -19,6 +19,7 @@ enum class PageType : uint8_t {
   kLeaf = 1,
   kInternal = 2,
   kMeta = 3,
+  kFree = 4,
 };
 
 struct LeafCell {

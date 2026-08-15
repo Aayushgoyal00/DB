@@ -1,8 +1,9 @@
 #pragma once
 
 #include <cstddef>
-#include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "index/kv_store.h"
@@ -10,9 +11,8 @@
 
 namespace dbengine {
 
-// An in-memory B+Tree used to establish the tree algorithms before nodes are
-// made page-backed in Phase 2.  The DiskManager argument is intentionally not
-// used in this phase.
+// Page-backed B+Tree. Page 0 is a small metadata page holding the root page
+// id; every other node is serialized through SlottedPage.
 class BPlusTreeEngine : public KVStore {
  public:
   explicit BPlusTreeEngine(DiskManager* disk_manager);
@@ -22,58 +22,50 @@ class BPlusTreeEngine : public KVStore {
   Status Delete(const std::string& key) override;
   std::unique_ptr<Iterator> Scan(const std::string& start_key) override;
 
-  // Diagnostics for tests and debug builds. They verify the properties that
-  // make searches correct without exposing the node representation.
+  // Diagnostics retained for the Phase 0 property tests.
   bool ValidateInvariants(std::string* error_out = nullptr) const;
   std::size_t Height() const;
 
  private:
-  static constexpr std::size_t kMaxChildren = 4;
-  static constexpr std::size_t kMaxKeys = kMaxChildren - 1;
-
-  struct Node {
-    explicit Node(bool leaf) : is_leaf(leaf) {}
-    virtual ~Node() = default;
-
-    bool is_leaf;
-  };
-
-  struct LeafNode final : Node {
-    LeafNode() : Node(true) {}
-
-    std::vector<std::string> keys;
-    std::vector<std::string> values;
-    LeafNode* next = nullptr;
-  };
-
-  struct InternalNode final : Node {
-    InternalNode() : Node(false) {}
-
-    std::vector<std::string> keys;
-    std::vector<std::unique_ptr<Node>> children;
-  };
-
   struct Split {
     std::string separator;
-    std::unique_ptr<Node> right;
+    page_id_t right_page_id;
+  };
+
+  struct LeafEntry {
+    std::string key;
+    std::string value;
+  };
+
+  struct InternalNodeData {
+    std::vector<std::string> keys;
+    std::vector<page_id_t> children;
   };
 
   class IteratorImpl;
 
-  LeafNode* FindLeaf(const std::string& key) const;
-  std::unique_ptr<Split> InsertRecursive(std::unique_ptr<Node>& node,
-                                         const std::string& key,
-                                         const std::string& value);
-  std::unique_ptr<Split> SplitLeaf(LeafNode* leaf);
-  std::unique_ptr<Split> SplitInternal(InternalNode* internal);
-  bool ValidateNode(const Node* node, std::size_t depth,
-                    std::size_t* leaf_depth, const std::string* lower_bound,
-                    const std::string* upper_bound, std::string* error_out,
-                    const LeafNode** previous_leaf) const;
+  Status InitializeOrLoadMetadata();
+  Status StoreRootPageId(page_id_t root_page_id);
+  Status FindLeaf(const std::string& key, page_id_t* leaf_page_id) const;
 
-  DiskManager* disk_manager_; // not owned
+  Status ReadLeaf(page_id_t page_id, std::vector<LeafEntry>* entries,
+                  page_id_t* right_sibling_page_id) const;
+  Status WriteLeaf(page_id_t page_id, const std::vector<LeafEntry>& entries,
+                   page_id_t right_sibling_page_id);
+  Status ReadInternal(page_id_t page_id, InternalNodeData* node) const;
+  Status WriteInternal(page_id_t page_id, const InternalNodeData& node);
+
+  Status InsertRecursive(page_id_t page_id, const std::string& key,
+                         const std::string& value,
+                         std::optional<Split>* split_out);
+  bool ValidatePage(page_id_t page_id, std::size_t depth,
+                    std::size_t* leaf_depth, std::string* last_key,
+                    page_id_t* expected_leaf_page_id,
+                    std::string* error_out) const;
+
+  DiskManager* disk_manager_;  // not owned
   page_id_t root_page_id_ = INVALID_PAGE_ID;
-  std::unique_ptr<Node> root_;
+  Status initialization_status_;
 };
 
-} // namespace dbengine
+}  // namespace dbengine

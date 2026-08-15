@@ -7,10 +7,9 @@ design rationale, data structures, and API contracts live in
 
 ## Status
 
-Phase 1 complete: the in-memory `BPlusTreeEngine` supports split-propagating
-inserts, lookups, scans, and non-rebalancing deletes; `SlottedPage` provides
-the fixed binary page header, variable-size cell directory, cell codecs, and
-CRC-32 verification needed before the tree becomes page-backed in Phase 2.
+Phase 2 complete: `BPlusTreeEngine` is page-backed through `DiskManager` and
+`SlottedPage`, with a persisted root metadata page, split propagation, leaf
+range scans, clean close/reopen support, and reusable deallocated pages.
 
 ## Build
 

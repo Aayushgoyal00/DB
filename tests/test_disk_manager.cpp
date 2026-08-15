@@ -53,18 +53,27 @@ int main() {
     Status bad_read = dm.ReadPage(99, read_buf);
     Check(!bad_read.ok() && bad_read.IsIOError() == false,
           "reading an unallocated page id returns an error status");
+
+    dbengine::page_id_t reusable_pid = dm.AllocatePage();
+    Check(reusable_pid == 1, "second allocated page id is 1");
+    Check(dm.DeallocatePage(reusable_pid).ok(), "deallocate a page into the free list");
+    Check(dm.AllocatePage() == reusable_pid,
+          "AllocatePage reuses an in-process free-list entry");
+    Check(dm.DeallocatePage(reusable_pid).ok(), "deallocate page for reopen test");
   }
 
   {
     // Reopen the same file and confirm allocation state survived restart.
     DiskManager dm(kTestFile);
-    Check(dm.GetNumPages() == 1,
+    Check(dm.GetNumPages() == 2,
           "num_pages recovered correctly after reopening the file");
 
     char read_buf[PAGE_SIZE];
     Status read_status = dm.ReadPage(0, read_buf);
     Check(read_status.ok() && std::strcmp(read_buf, "hello page zero") == 0,
           "data written before restart is still readable after restart");
+    Check(dm.AllocatePage() == 1,
+          "free-list marker survives reopen and reuses the freed page");
   }
 
   std::remove(kTestFile);

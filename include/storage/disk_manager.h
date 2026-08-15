@@ -3,6 +3,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "common/config.h"
 #include "common/status.h"
@@ -35,8 +36,12 @@ class DiskManager {
   Status WritePage(page_id_t page_id, const char* page_data);
 
   // Bump-pointer allocation: hands out the next unused page id and grows
-  // the file. Freed pages are not reused until Phase 2 adds a free-list.
+  // the file. Deallocated pages are reused before growing the file.
   page_id_t AllocatePage();
+
+  // Marks a page reusable. The free marker is persisted in the page itself;
+  // the free list is rebuilt by scanning those markers when the file opens.
+  Status DeallocatePage(page_id_t page_id);
 
   // Total number of pages currently allocated in the file.
   size_t GetNumPages() const { return num_pages_; }
@@ -45,6 +50,7 @@ class DiskManager {
   std::fstream db_io_;
   std::string db_file_path_;
   size_t num_pages_ = 0;
+  std::vector<page_id_t> free_pages_;
   std::mutex io_mutex_; // guards db_io_; every method above takes this
 };
 

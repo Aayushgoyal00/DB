@@ -345,10 +345,10 @@ Phase 0's `LeafNode::next` and Phase 1's header field exist.
   against later.
 
 ### 6.4 Definition of done
-- [ ] All Phase 0 tests pass against the persistent engine.
-- [ ] Tree survives close/reopen with data intact.
-- [ ] Free-list reuses at least one deleted page in a targeted test.
-- [ ] `Scan` correctly returns a sorted range spanning multiple leaves.
+- [x] All Phase 0 tests pass against the persistent engine.
+- [x] Tree survives close/reopen with data intact.
+- [x] Free-list reuses at least one deleted page in a targeted test.
+- [x] `Scan` correctly returns a sorted range spanning multiple leaves.
 
 ---
 
