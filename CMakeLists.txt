@@ -23,5 +23,9 @@ target_include_directories(dbengine_core PUBLIC include)
 add_executable(dbengine main.cpp)
 target_link_libraries(dbengine PRIVATE dbengine_core)
 
+# Diagnostic tool: read-only dump of the on-disk B+ tree structure.
+add_executable(dump_tree tools/dump_tree.cpp)
+target_link_libraries(dump_tree PRIVATE dbengine_core)
+
 enable_testing()
 add_subdirectory(tests)

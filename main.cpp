@@ -96,7 +96,7 @@ int main() {
       if (status.ok()) {
         std::cout << "ok\n";
       } else {
-        std::cout << "error: " << status.ToString() << "\n";
+        std::cout << "error: " << status.message() << "\n";
       }
       continue;
     }
@@ -115,7 +115,7 @@ int main() {
       } else if (status.IsNotFound()) {
         std::cout << "(not found)\n";
       } else {
-        std::cout << "error: " << status.ToString() << "\n";
+        std::cout << "error: " << status.message() << "\n";
       }
       continue;
     }
@@ -133,7 +133,7 @@ int main() {
       } else if (status.IsNotFound()) {
         std::cout << "(not found)\n";
       } else {
-        std::cout << "error: " << status.ToString() << "\n";
+        std::cout << "error: " << status.message() << "\n";
       }
       continue;
     }
