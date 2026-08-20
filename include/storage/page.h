@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstring>
+#include <shared_mutex>
 
 #include "common/config.h"
 
@@ -14,6 +15,9 @@ namespace dbengine {
 class Page {
  public:
   Page() { ResetMemory(); }
+
+  std::shared_mutex& Latch() { return latch_; }
+  const std::shared_mutex& Latch() const { return latch_; }
 
   char* GetData() { return data_; }
   const char* GetData() const { return data_; }
@@ -38,9 +42,10 @@ class Page {
   bool is_dirty_ = false;
   int pin_count_ = 0;
 
-  // Phase 3 will add a std::shared_mutex here for latch-based concurrency
-  // control (see ARCHITECTURE.md, Phase 3). Left out of Phase 0 on purpose —
-  // no point synchronizing single-threaded code.
+  // Per-page reader/writer latch. Pinning (BufferPoolManager) keeps the
+  // frame alive; this latch keeps the page bytes consistent while callers
+  // read or write them. mutable so const GetData() can still lock for read.
+  mutable std::shared_mutex latch_;
 };
 
 } // namespace dbengine
