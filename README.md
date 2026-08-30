@@ -1,168 +1,145 @@
-# dbengine
+# silt
 
-A small on-disk key-value database engine written in C++20. It follows the
-Phase 0–2 approach described in *Database Internals* and stores data in a
-page-backed B+ tree using a custom slotted-page format.
+A from-scratch key-value storage engine in C++, built by following
+*Database Internals* (Petrov, 2019) chapter by chapter. Two interchangeable
+backends — an on-disk B+Tree and (later) an LSM tree — sit behind one
+interface, with real durability through a write-ahead log and ARIES-lite
+recovery.
 
-For the architecture notes and the deeper design rationale, see
-[ARCHITECTURE.md](./ARCHITECTURE.md).
+The point of the project is the internals: page layouts, slotted cells,
+buffer pool eviction, write-ahead logging, redo/undo. Every concept maps
+to a section of the book.
 
-## Current status
+## What's in the box
 
-This repository is in a working Phase 2 state.
+A working storage engine with:
 
-What is already implemented:
-- persistent metadata page at page 0
-- on-disk root pointer tracking
-- fixed-size page storage via `DiskManager`
-- slotted pages with checksum verification
-- B+ tree leaf and internal nodes
-- key insert/update logic with split propagation
-- leaf scan iteration across sorted keys
-- simple CLI REPL for put/get/delete/scan/pages
-- tree inspection tool to dump the real database structure from a file
+- **On-disk B+Tree** — page-backed nodes, slotted page format, page headers
+  with CRC32 checksums, free-list for reused pages, range scans via
+  right-sibling pointers.
+- **Buffer pool** — fixed-size frame pool with a clock (second-chance)
+  replacer, pin-count tracking, dirty-page writeback on eviction, and
+  per-page reader/writer latches for concurrent access.
+- **Write-ahead log** — append-only log of typed records (`Insert`,
+  `Update`, `Delete`, `Begin`, `Commit`, `Abort`, `Checkpoint`) with
+  per-record CRC, framed length prefixes, and torn-write detection.
+- **ARIES-lite recovery** — three-pass recovery (analysis, redo, undo)
+  on startup if the last shutdown wasn't clean. Committed work survives
+  crashes; uncommitted work is rolled back.
+- **Pluggable engine interface** — every backend implements the same
+  `KVStore` (`Get`, `Put`, `Delete`, `Scan`). The B+Tree is wired up
+  today; an LSM engine is on the roadmap and will drop in without
+  touching call sites.
 
-What is not fully implemented yet:
-- advanced delete rebalancing and page reclamation
-- concurrency control
-- WAL / crash recovery
-- LSM backend
-- SQL layer or client/server protocol
+## Architecture
 
-This is still a storage-engine prototype, not a production database.
+```
+                 ┌─────────────────────┐
+                 │   BPlusTreeEngine   │  ← pluggable KVStore impl
+                 └──────────┬──────────┘
+                            │
+                 ┌──────────▼──────────┐
+                 │  BufferPoolManager  │  ← frame pool + clock replacer
+                 └──────────┬──────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            │               │               │
+   ┌────────▼─────┐  ┌──────▼──────┐ ┌──────▼───────┐
+   │  DiskManager │  │ LogManager │ │ SlottedPage  │
+   │ (raw file I/O)│  │   (WAL)    │ │ (cell codec) │
+   └──────────────┘  └─────────────┘ └──────────────┘
 
-## Quick start
-
-### Prerequisites
-
-- C++20 compiler
-- CMake 3.16+
-- Ninja or Make
-
-### Linux / macOS
-
-```bash
-cmake -S . -B build -G Ninja
-cmake --build build
-./build/dbengine
+   On unclean shutdown → RecoveryManager runs:
+     Analysis → Redo → Undo
 ```
 
-If Ninja is not available:
+Each layer has one job. The buffer pool is the only thing that calls
+`DiskManager`. The WAL is enforced by the buffer pool: no dirty page
+reaches disk before its log record does.
 
-```bash
-cmake -S . -B build
-cmake --build build
-./build/dbengine
+## Project layout
+
+```
+silt/
+  include/
+    common/        config, Status type
+    storage/       Page, DiskManager, SlottedPage, Replacer,
+                   BufferPoolManager, LogManager, LogRecord
+    index/         KVStore interface, BPlusTreeEngine
+    txn/           RecoveryManager (ARIES-lite)
+  src/             mirrors include/, one .cpp per header
+  tests/           one test binary per module
+  tools/           dump_tree diagnostic
+  main.cpp         CLI entry point
+  CMakeLists.txt
 ```
 
-### Windows (MinGW / MSYS2 / Git Bash)
+## Build
+
+Requirements: a C++20 compiler (GCC 12+, Clang 15+, MSVC 19.30+), CMake
+3.16+, and Ninja (recommended).
 
 ```bash
-cmake -S . -B build -G Ninja
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/dbengine.exe
 ```
 
-Or using a generator already available on the machine:
+Produces `build/silt` (CLI), `build/dump_tree` (diagnostic), and the
+test binaries under `build/tests/`.
+
+## Run
+
+The CLI is a thin placeholder today. Real usage is through the test
+binaries and by linking `dbengine_core` from your own code:
+
+```cpp
+#include "storage/disk_manager.h"
+#include "storage/buffer_pool_manager.h"
+#include "storage/log_manager.h"
+#include "index/bplus_tree_engine.h"
+
+dbengine::DiskManager dm("mydb.db");
+dbengine::LogManager lm("mydb.wal");
+dbengine::BufferPoolManager bpm(/*pool=*/1024, &dm, &lm);
+dbengine::BPlusTreeEngine engine(&bpm);
+
+engine.Put("hello", "world");
+std::string v;
+engine.Get("hello", &v);   // v == "world"
+```
+
+A diagnostic dump of an on-disk tree:
 
 ```bash
-cmake -S . -B build
-cmake --build build
-./build/dbengine.exe
+./build/dump_tree mydb.db
 ```
 
-### Run the tests
+## Test
 
 ```bash
 ctest --test-dir build --output-on-failure
 ```
 
-## CLI usage
-
-Start the database:
+Or run an individual suite directly:
 
 ```bash
-./build/dbengine
+./build/tests/test_bplus_tree
+./build/tests/test_slotted_page
 ```
 
-Then use commands like:
+## Roadmap
 
-```text
-db> help
-Commands:
-  put <key> <value>        Insert or update a key
-  get <key>                Read a key
-  delete <key>             Remove a key
-  scan <start_key> [limit] Scan keys in sorted order
-  pages                    Show current allocated page count
-  help                     Show this help
-  exit                     Quit
+The plan is in `ARCHITECTURE.md`. Roughly:
 
-DB> put user1 100
-DB> get user1
-100
-DB> scan user1 10
-DB> pages
-DB> exit
-```
+- ✅ Phase 0 — in-memory B+Tree
+- ✅ Phase 1 — slotted page format with checksums
+- ✅ Phase 2 — persistent, on-disk B+Tree
+- ✅ Phase 3 — buffer pool, WAL, ARIES-lite recovery
+- ⏳ Phase 4 — copy-on-write B-Tree variant (snapshot isolation)
+- ⏳ Phase 5 — LSM engine (MemTable, SSTable, compaction, bloom filters)
 
-## Inspect the current B+ tree
+## References
 
-The repository includes a tree-dump utility that reads the real on-disk file and prints the structure of the root and child pages.
-
-```bash
-./build/dump_tree dbengine.db --pretty
-```
-
-This is useful for debugging page layout, split behavior, and root/leaf relationships without needing to write your own page parser.
-
-## How the engine works today
-
-The architecture is intentionally simple:
-
-- `DiskManager` owns the database file and page allocation
-- `SlottedPage` manages cell storage inside a page
-- `BPlusTreeEngine` stores keys/values in leaf pages and separators in internal pages
-- the root page ID is persisted in page 0 metadata
-- inserts split a full leaf or internal node and propagate a separator upward
-
-This means the project already behaves like a small, on-disk key-value database with B+ tree indexing, even though it is still a learning-oriented implementation rather than a polished production engine.
-
-## Repository layout
-
-```text
-.
-├── CMakeLists.txt
-├── ARCHITECTURE.md
-├── README.md
-├── main.cpp
-├── include/
-│   ├── common/
-│   ├── storage/
-│   └── index/
-├── src/
-│   ├── storage/
-│   └── index/
-├── tests/
-├── tools/
-│   └── dump_tree.cpp
-├── build/
-├── dbengine.db
-└── ...
-```
-
-## Recommended next steps
-
-If you want to continue developing this engine, the natural follow-ups are:
-
-1. implement delete rebalancing and page reuse
-2. add proper duplicate-key semantics and validation rules
-3. add WAL / crash recovery
-4. support larger records and page occupancy tuning
-5. benchmark insert/scan performance
-6. add a stronger test suite for tree invariants
-
-## Notes
-
-This repository is aimed at learning and prototyping. It is already runnable and suitable for experimenting with B+ tree behavior, but it is not yet a full database system with transactional guarantees or production robustness.
-
+- Alex Petrov, *Database Internals*, O'Reilly 2019
+- ARIES paper (Mohan et al., 1992) — the recovery algorithm this
+  project implements in simplified form

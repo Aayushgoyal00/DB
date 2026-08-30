@@ -4,10 +4,12 @@
 
 namespace dbengine {
 
-BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager)
+BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager,
+                                   LogManager* log_manager)
     : pool_size_(pool_size),
       pages_(new Page[pool_size]),
-      disk_manager_(disk_manager) {
+      disk_manager_(disk_manager),
+      log_manager_(log_manager) {
   free_list_.clear();
   for (size_t i = 0; i < pool_size_; ++i) {
     free_list_.push_back(static_cast<frame_id_t>(pool_size_ - 1 - i));
@@ -48,6 +50,11 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
 
   page_id_t old_pid = pages_[fid].GetPageId();
   if (old_pid != INVALID_PAGE_ID && pages_[fid].IsDirty()) {
+    if (log_manager_ &&
+        pages_[fid].GetPageLSN() > log_manager_->GetFlushedLSN()) {
+      Status fs = log_manager_->Flush();
+      if (!fs.ok()) return nullptr;
+    }
     Status s = disk_manager_->WritePage(old_pid, pages_[fid].GetData());
     if (!s.ok()) return nullptr;
   }
@@ -87,6 +94,10 @@ Status BufferPoolManager::FlushPage(page_id_t page_id) {
   if (it == page_table_.end()) return Status::OK();
   Page& p = pages_[it->second];
   if (!p.IsDirty()) return Status::OK();
+  if (log_manager_ && p.GetPageLSN() > log_manager_->GetFlushedLSN()) {
+    Status fs = log_manager_->Flush();
+    if (!fs.ok()) return fs;
+  }
   Status s = disk_manager_->WritePage(page_id, p.GetData());
   if (!s.ok()) return s;
   p.SetDirty(false);
@@ -101,6 +112,10 @@ Status BufferPoolManager::FlushAllPages() {
     frame_id_t fid = kv.second;
     Page& p = pages_[fid];
     if (!p.IsDirty()) continue;
+    if (log_manager_ && p.GetPageLSN() > log_manager_->GetFlushedLSN()) {
+      Status fs = log_manager_->Flush();
+      if (!fs.ok() && first_error.ok()) first_error = fs;
+    }
     Status s = disk_manager_->WritePage(pid, p.GetData());
     if (!s.ok() && first_error.ok()) first_error = s;
     else p.SetDirty(false);
@@ -116,6 +131,11 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id_out) {
 
   page_id_t old_pid = pages_[fid].GetPageId();
   if (old_pid != INVALID_PAGE_ID && pages_[fid].IsDirty()) {
+    if (log_manager_ &&
+        pages_[fid].GetPageLSN() > log_manager_->GetFlushedLSN()) {
+      Status fs = log_manager_->Flush();
+      if (!fs.ok()) return nullptr;
+    }
     Status s = disk_manager_->WritePage(old_pid, pages_[fid].GetData());
     if (!s.ok()) return nullptr;
   }
@@ -125,6 +145,7 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id_out) {
   std::memset(pages_[fid].GetData(), 0, PAGE_SIZE);
   pages_[fid].SetPageId(new_pid);
   pages_[fid].SetDirty(false);
+  pages_[fid].SetPageLSN(INVALID_LSN);
   pages_[fid].IncPinCount();
   page_table_[new_pid] = fid;
   replacer_->RecordAccess(fid);

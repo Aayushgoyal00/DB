@@ -17,6 +17,9 @@ add_library(dbengine_core
   src/storage/slotted_page.cpp
   src/storage/replacer.cpp
   src/storage/buffer_pool_manager.cpp
+  src/storage/log_record.cpp
+  src/storage/log_manager.cpp
+  src/txn/recovery_manager.cpp
   src/index/bplus_tree_engine.cpp
 )
 target_include_directories(dbengine_core PUBLIC include)

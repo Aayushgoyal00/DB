@@ -9,6 +9,7 @@
 #include "common/config.h"
 #include "common/status.h"
 #include "storage/disk_manager.h"
+#include "storage/log_manager.h"
 #include "storage/page.h"
 #include "storage/replacer.h"
 
@@ -25,7 +26,8 @@ namespace dbengine {
 //   it gives use-after-free the moment eviction flushes the frame.
 class BufferPoolManager {
  public:
-  BufferPoolManager(size_t pool_size, DiskManager* disk_manager);
+  BufferPoolManager(size_t pool_size, DiskManager* disk_manager,
+                    LogManager* log_manager = nullptr);
   ~BufferPoolManager();
 
   BufferPoolManager(const BufferPoolManager&) = delete;
@@ -70,6 +72,7 @@ class BufferPoolManager {
   std::list<frame_id_t> free_list_;
   std::unique_ptr<Replacer> replacer_;
   DiskManager* disk_manager_;
+  LogManager* log_manager_;  // not owned; optional but required for WAL
 
   std::mutex latch_;
 

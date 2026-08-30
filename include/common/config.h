@@ -20,4 +20,14 @@ constexpr page_id_t INVALID_PAGE_ID = -1;
 // here so later phases don't need to touch this header again.
 using frame_id_t = int32_t;
 
+// Log sequence number — monotonically increasing position in the WAL.
+// u64 because a busy engine writes millions of records per second and we
+// never want this to wrap in any realistic deployment.
+using lsn_t = uint64_t;
+constexpr lsn_t INVALID_LSN = 0;
+
+// Transaction id. u32 is plenty for a single-node engine.
+using txn_id_t = uint32_t;
+constexpr txn_id_t INVALID_TXN_ID = 0;
+
 } // namespace dbengine

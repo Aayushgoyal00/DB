@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <span>
 #include <string>
@@ -122,7 +123,8 @@ void TestCapacityAndChecksum() {
   Check(source.InsertCell(0, checksum_cell).ok(), "create page for checksum test");
   bool detects_all_single_byte_changes = true;
   for (std::size_t i = 0; i < PAGE_SIZE; ++i) {
-    Page corrupted = checksum_source;
+    Page corrupted;
+    std::memcpy(corrupted.GetData(), checksum_source.GetData(), PAGE_SIZE);
     corrupted.GetData()[i] ^= static_cast<char>(0x5a);
     SlottedPage corrupt_page(&corrupted);
     detects_all_single_byte_changes = !corrupt_page.VerifyChecksum() &&

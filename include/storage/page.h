@@ -28,6 +28,9 @@ class Page {
   bool IsDirty() const { return is_dirty_; }
   void SetDirty(bool dirty) { is_dirty_ = dirty; }
 
+  lsn_t GetPageLSN() const { return page_lsn_; }
+  void SetPageLSN(lsn_t lsn) { page_lsn_ = lsn; }
+
   int PinCount() const { return pin_count_; }
   void IncPinCount() { ++pin_count_; }
   void DecPinCount() {
@@ -41,6 +44,7 @@ class Page {
   page_id_t page_id_ = INVALID_PAGE_ID;
   bool is_dirty_ = false;
   int pin_count_ = 0;
+  lsn_t page_lsn_ = INVALID_LSN;
 
   // Per-page reader/writer latch. Pinning (BufferPoolManager) keeps the
   // frame alive; this latch keeps the page bytes consistent while callers
