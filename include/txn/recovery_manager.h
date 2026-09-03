@@ -74,6 +74,8 @@ class RecoveryManager {
   std::unordered_map<page_id_t, lsn_t> dirty_page_table_;
   std::unordered_map<txn_id_t, lsn_t> active_txn_table_;
   std::unordered_set<txn_id_t> active_txn_set_;
+  std::unordered_set<txn_id_t> committed_txn_set_;
+  std::unordered_set<txn_id_t> aborted_txn_set_;
 
   // Per-txn record chain (newest last), built in Analysis so UNDO can
   // walk backward without re-scanning.

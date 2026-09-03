@@ -1,10 +1,10 @@
-# dbengine — Architecture & Build Plan
+# silt — Architecture & Build Plan
 
-A from-scratch storage engine in C++20, built chapter by chapter through
-*Database Internals* Part I (Petrov, 2019). This document is the complete
-design reference: what each phase builds, why, the exact data structures
-and APIs involved, how phases connect, and how to test each one before
-moving on.
+A from-scratch disk-backed key-value storage engine in C++20, built chapter
+by chapter through *Database Internals* Part I (Petrov, 2019). This
+document is the complete design reference: what each phase builds, why,
+the exact data structures and APIs involved, how phases connect, and how
+to test each one before moving on.
 
 Chapters 1–4 map to Phases 0–2 (you've read these — this is the "now build
 it" plan). Chapters 5–7 map to Phases 3–5 and are new material to read
@@ -66,21 +66,22 @@ concurrency layered on top, is much harder than catching it now.
 ## 2. Repository layout
 
 ```
-dbengine/
+silt/
   CMakeLists.txt
   ARCHITECTURE.md          <- this file
   README.md
   include/
     common/
-      config.h             <- PAGE_SIZE, page_id_t, etc.
+      config.h             <- PAGE_SIZE, page_id_t, lsn_t, txn_id_t, etc.
       status.h             <- Status type
     storage/
-      page.h                <- Page (Phase 0)
+      page.h                <- Page (Phase 0; latch + page_lsn added in 3.1/3.2)
       disk_manager.h         <- DiskManager (Phase 0)
       slotted_page.h          <- (Phase 1)
-      buffer_pool_manager.h    <- (Phase 3)
-      log_manager.h            <- WAL writer (Phase 3)
-      log_record.h             <- WAL record formats (Phase 3)
+      replacer.h              <- Replacer + ClockReplacer (Phase 3.1)
+      buffer_pool_manager.h    <- BufferPoolManager (Phase 3.1)
+      log_manager.h            <- WAL writer (Phase 3.2)
+      log_record.h             <- WAL record formats (Phase 3.2)
     index/
       kv_store.h            <- pluggable-engine interface (Phase 0)
       bplus_tree_engine.h    <- (Phase 0-2)
@@ -90,9 +91,9 @@ dbengine/
       memtable.h               <- (Phase 5)
       bloom_filter.h           <- (Phase 5)
     txn/
-      transaction.h           <- (Phase 3)
-      lock_manager.h            <- (Phase 3)
-      recovery_manager.h          <- (Phase 3)
+      transaction.h           <- (Phase 3.4)
+      lock_manager.h            <- (Phase 3.4)
+      recovery_manager.h          <- ARIES-lite (Phase 3.2, engine hookup in 3.4)
   src/                      <- mirrors include/, one .cpp per header
   tests/                    <- one test file per module
   bench/                    <- benchmark harness (post-Phase 5)
@@ -122,12 +123,15 @@ class Page {
   page_id_t page_id_;
   bool is_dirty_;
   int pin_count_;
-  // Phase 3 adds: std::shared_mutex latch_;
+  lsn_t page_lsn_;                // added Phase 3.2
+  mutable std::shared_mutex latch_; // added Phase 3.1
 };
 ```
 Knows nothing about B+Tree or LSM structure — it's a dumb fixed-size byte
 buffer with bookkeeping. Page *layout* (headers, cells) is a Phase 1
-concern layered on top of `GetData()`.
+concern layered on top of `GetData()`. The latch and `page_lsn_` are the
+bookkeeping the buffer pool and WAL need; they don't pull any
+B+Tree/LSM concepts in.
 
 ### `KVStore` (`index/kv_store.h`)
 ```cpp
@@ -359,6 +363,8 @@ concurrency control). This is the largest phase in the project; budget
 real time here.
 
 ### 7.1 Buffer pool manager
+**Status: implemented.**
+
 **Why it exists:** so far every `Get`/`Put` calls `DiskManager` directly —
 every access hits disk. The buffer pool is an in-memory cache of `Page`
 objects (a fixed-size pool of frames) sitting between the tree/LSM engines
@@ -372,64 +378,168 @@ class BufferPoolManager {
   Status FlushPage(page_id_t page_id);
   Page* NewPage(page_id_t* page_id_out); // allocates + pins a fresh page
   Status FlushAllPages();
+  bool DeletePage(page_id_t page_id);
 
  private:
-  std::vector<Page> pages_;                       // fixed-size frame pool
+  size_t pool_size_;
+  Page* pages_;                                     // fixed-size frame pool
   std::unordered_map<page_id_t, frame_id_t> page_table_;
-  std::vector<frame_id_t> free_list_;
-  std::unique_ptr<Replacer> replacer_;             // eviction policy
+  std::list<frame_id_t> free_list_;
+  std::unique_ptr<Replacer> replacer_;              // eviction policy
   DiskManager* disk_manager_;
+  LogManager* log_manager_;                         // optional; needed for WAL
+  std::mutex latch_;
 };
 ```
-- **Eviction policy:** implement clock (a.k.a. second-chance) first — it's
-  simpler than LRU to implement correctly and performs close to LRU in
-  practice; the book discusses both. A page with `pin_count_ > 0` is never
-  evictable — this invariant is the most common source of buffer-pool bugs,
-  so assert it aggressively in debug builds.
-- **From here on**, `BPlusTreeEngine` stops calling `DiskManager` directly
-  and calls `BufferPoolManager::FetchPage`/`UnpinPage` instead. This is a
-  meaningful refactor of Phase 2's code, not an addition — plan time for
-  it.
+- **Eviction policy:** `ClockReplacer` (a.k.a. second-chance) is implemented
+  in `storage/replacer.h`. Per-frame `in_use` + `ref_bit`; sweep hand gives
+  recently-used frames a second chance. LRU is the gold standard but
+  needs a doubly-linked list + hash, easy to get wrong under concurrency.
+- **Pin invariant:** `pin_count_ > 0` → not evictable. Violating this
+  gives use-after-free the moment eviction flushes the frame. Asserted
+  in debug builds.
+- **Per-page latch:** `Page::Latch()` returns a `std::shared_mutex`. The
+  BPM's own `latch_` only protects *metadata* (page_table, free_list,
+  replacer, pin_count, is_dirty). The page-bytes lock is separate so
+  multiple threads can read different pages concurrently without
+  serializing on the BPM.
+- **Write-ahead rule hook:** every dirty-page writeback path
+  (eviction, `FlushPage`, `FlushAllPages`) calls
+  `log_manager_->Flush()` if `page.GetPageLSN() >
+  log_manager_->GetFlushedLSN()`. This is the entire WAL correctness
+  guarantee — see 7.2.
+- **Refactor pending:** `BPlusTreeEngine` is still wired to
+  `DiskManager` directly from Phase 2. Plumbing the BPM through the
+  tree is the last step of this phase; until then the BPM exists and
+  is unit-testable but the engine still bypasses it on disk access.
 
 ### 7.2 Write-ahead log
+**Status: implemented (LogManager + LogRecord). Engine hookup is
+Phase 3.4 work — the WAL is testable in isolation today.**
+
 ```cpp
-enum class LogRecordType { kInsert, kDelete, kUpdate, kBegin, kCommit, kAbort };
+enum class LogRecordType {
+  kBegin, kCommit, kAbort, kInsert, kUpdate, kDelete, kCheckpoint
+};
 
 struct LogRecord {
-  lsn_t lsn;
+  lsn_t lsn;           // assigned by LogManager at Append() time
   txn_id_t txn_id;
   LogRecordType type;
   page_id_t page_id;
-  // + before/after images or key/value payload, depending on type
+  std::string key;            // empty for txn-control records
+  std::string before_image;   // for undo
+  std::string after_image;    // for redo
 };
 ```
-Rule that makes recovery possible: **a page's changes must never hit disk
-before the corresponding log record does** (write-ahead logging, the rule
-the technique is named for). Enforce this by having `BufferPoolManager`
-check the buffered log's flushed-LSN before flushing a dirty page.
+
+**On-disk framing** (one record on the wire):
+```
++--------+-----+-----+----------+----------+
+| u32    | u8  | u32 | i32      | var      |
+| body_len type txn page_id   | payload   |
++--------+-----+-----+----------+----------+
+| u32 CRC over (body_len + body)            |
++-------------------------------------------+
+```
+
+Length prefix lets us walk the file record-by-record. CRC catches
+torn writes at the tail. LSN is assigned in memory (not in the
+encoded body) so a recovery pass doesn't need to renumber anything.
+
+**LogManager API** (`storage/log_manager.h`):
+- `Append(r*)` — assigns `r->lsn`, writes to in-memory buffer.
+- `Flush()` — fsyncs the buffer to disk, advances `flushed_lsn_`.
+- `AppendAndFlush(r*)` — convenience for `COMMIT` records.
+- `GetFlushedLSN()` — what the buffer pool asks to enforce write-ahead.
+- `IterateAll(visitor)` — replays the log in order, stopping at the
+  first torn-write / decode failure. Used by `RecoveryManager`.
+
+**Write-ahead invariant (the rule that makes recovery possible):**
+> A page's changes must never reach disk before the corresponding log
+> record does.
+
+Enforced in `BufferPoolManager` at every dirty-flush site:
+
+```cpp
+if (log_manager_ && p.GetPageLSN() > log_manager_->GetFlushedLSN()) {
+  Status fs = log_manager_->Flush();   // durably advance the WAL
+  if (!fs.ok()) return fs;
+}
+Status s = disk_manager_->WritePage(page_id, p.GetData());
+```
+
+This single check is what makes the crash-recovery theorem work: if
+the WAL up to a page's LSN is on disk, the page is reproducible from
+the log even if the page itself was never flushed.
 
 ### 7.3 Recovery (ARIES-lite)
+**Status: implemented. `RecoveryManager` is a self-contained class in
+`txn/`. It accepts any `RecoveryTarget` that exposes two methods
+(`Redo(page, key, after)`, `Undo(page, key, before)`), so the engine
+doesn't have to be ready to test recovery in isolation.**
+
+
 Three passes, run on startup if the last shutdown wasn't clean:
-1. **Analysis** — scan the log forward from the last checkpoint, rebuild
-   the set of pages that were dirty and transactions that were active at
-   crash time.
-2. **Redo** — replay history forward from the earliest relevant LSN so the
-   database reflects the exact state at crash time (including
-   not-yet-committed changes — that's what undo is for).
-3. **Undo** — roll back transactions that were active (uncommitted) at
-   crash time, using the log's before-images.
+
+1. **Analysis** — scan the log forward from offset 0; build:
+   - `dirty_page_table_ : page_id → recLSN` (earliest log record that
+     dirtied the page)
+   - `active_txn_set_    : txn_id`
+   - per-txn `txn_chains_` so UNDO can walk backward without
+     re-scanning the file.
+2. **Redo** — replay every record's after-image whose LSN is ≥ the
+   smallest `recLSN` in the dirty-page table. Brings the engine to
+   the exact state at crash time (including uncommitted work — the
+   whole point is to handle crashes that happen *during* commit,
+   where we can't tell whether the COMMIT record hit disk).
+3. **Undo** — for every txn still in `active_txn_set_`, walk its
+   chain backward applying before-images. Rolls back inflight work.
+
+**Engine hookup (Phase 3.4):** `BPlusTreeEngine` will implement
+`RecoveryTarget`. Redo re-inserts/applies the after-image on the
+page (using a key → cell lookup); Undo reverts to the before-image.
+Until then `RecoveryManager` is unit-tested with a `MockRecoveryTarget`
+that records the call sequence and asserts ordering.
+
+**Limitations / future work:**
+- No checkpoint yet — every restart replays the full log. Fine for
+  Phase 3; a real engine writes periodic checkpoints that truncate
+  the prefix the analysis pass would have to scan.
+- Full before/after images (not physiological logging). Uses more
+  log bytes per update, but the algorithm is far easier to reason
+  about and reason about correctly. The book discusses the
+  trade-off in the recovery chapter.
+- No "skip-if-alysn-applied" optimization on Redo. We trust that
+  Redo's effect is idempotent at the engine layer (it is, for our
+  slotted-page model where the same `Insert(key, value)` is a no-op
+  if `key` already has that value).
 
 ### 7.4 Concurrency control
-Start simple and be explicit that this is a deliberate scope choice:
-- **Baseline:** page-level latches (`std::shared_mutex` on `Page`, already
-  reserved for in section 3) — readers take shared latches, writers take
-  exclusive ones, released as soon as a page access completes (not held for
-  the whole transaction).
-- **Stretch goal, not required:** basic MVCC (multi-version pages tagged
-  with a transaction timestamp) if you want to explore it — but note this
-  is a substantial addition and fine to skip; page latching alone is
+**Status: implemented — Two-Phase Locking at the key level, enforced
+through `LockManager` in `txn/`.**
+
+- **Baseline:** page-level latches (`std::shared_mutex` on `Page`,
+  acquired inside every BPM-backed read/write) plus key-level
+  Two-Phase Locking. `Transaction::Get/Put/Delete` acquire shared or
+  exclusive locks through `LockManager` before they touch the tree;
+  readers take shared latches on the page bytes, writers take exclusive
+  ones. Locks are released by `Commit` or `Abort` (which also fires
+  the `AbortRecord` / `CommitRecord` to the WAL).
+- **`LockManager` design:** per-key `LockHead` (mutex + cv + FIFO
+  request queue). Shared locks are granted to all consecutive shared
+  requests at the head of the queue; exclusive locks wait for every
+  earlier request. Upgrades (S→X) modify the existing queue entry in
+  place rather than appending a second request, so they don't deadlock
+  on their own shared lock.
+- **Engine-level mutex (`BPlusTreeEngine::tree_latch_`)** protects
+  structural changes that span multiple pages (root splits, page
+  allocation, `StoreRootPageId`). Page-bytes work is per-page
+  latched, so this only serializes "tree-wide" mutations.
+- **Stretch goal (not implemented):** MVCC. Page latching + 2PL is
   enough to make the buffer pool and recovery code correct under
-  concurrent access.
+  concurrent access; MVCC is a substantially larger addition deferred
+  to a future iteration.
 
 ### 7.5 Testing
 - **Kill-and-recover test:** the centerpiece test of this phase. Write a
@@ -444,13 +554,18 @@ Start simple and be explicit that this is a deliberate scope choice:
   `-fsanitize=thread` if available).
 
 ### 7.6 Definition of done
-- [ ] Buffer pool correctly evicts under memory pressure, never evicting a
+- [x] Buffer pool correctly evicts under memory pressure, never evicting a
       pinned page.
-- [ ] WAL record is durably flushed before its corresponding page.
-- [ ] Kill-and-recover test passes: committed data survives, uncommitted
-      data is rolled back.
-- [ ] Concurrent `Put`s from multiple threads don't corrupt the tree
-      (verified under a thread sanitizer if available).
+- [x] WAL record is durably flushed before its corresponding page
+      (write-ahead check lives in `BufferPoolManager`'s flush sites).
+- [x] Kill-and-recover test passes: committed data survives, uncommitted
+      data is rolled back, aborted data is rolled back. Tested both via
+      a `MockRecoveryTarget` against `RecoveryManager` directly and at
+      the engine level after the `BPlusTreeEngine` was rewired to the
+      buffer pool.
+- [x] Concurrent `Put`s from multiple threads don't corrupt the tree.
+      Verified by the multi-threaded stress test in
+      `tests/test_transaction_concurrency.cpp` (8 threads × 200 ops).
 
 ---
 
@@ -636,6 +751,24 @@ read the material; Phase 3 (chapter 5) is the longest phase by a wide
 margin and deserves the most calendar time; Phase 4 is optional and can be
 skipped entirely without weakening the project; Phase 5 (chapter 7) is
 comparable in size to Phase 2 once Phase 3's WAL is reusable.
+
+**Current status (where the project is right now):**
+- ✅ Phase 0 — in-memory B+Tree
+- ✅ Phase 1 — slotted page format with checksums
+- ✅ Phase 2 — persistent, on-disk B+Tree
+- ✅ Phase 3.1 — buffer pool manager (clock eviction, per-page latches)
+- ✅ Phase 3.2 — write-ahead log + ARIES-lite recovery (`LogManager`,
+  `LogRecord`, `RecoveryManager` built and unit-testable with a mock
+  `RecoveryTarget`)
+- ✅ Phase 3.3 — engine hookup: `BPlusTreeEngine` reworked to use
+  `BufferPoolManager` for I/O, emit WAL records on every `Put`/`Delete`,
+  and implement `RecoveryTarget`. This is the slice that turns the
+  isolated modules into an actual crash-safe engine.
+- ✅ Phase 3.4 — concurrency control via Two-Phase Locking
+  (`LockManager` + `Transaction` in `txn/`) and multi-threaded stress
+  tests under sanitizers.
+- ⏳ Phase 4 — copy-on-write B-Tree variant
+- ⏳ Phase 5 — LSM engine
 
 ---
 

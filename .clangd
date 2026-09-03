@@ -1,0 +1,12 @@
+CompileFlags:
+  CompilationDatabase: build
+  Compiler: C:/msys64/mingw64/bin/g++.exe
+  Add: [-isystem, C:/msys64/mingw64/lib/gcc/x86_64-w64-mingw32/16.2.0/include]
+
+Index:
+  Background: Build
+
+Diagnostics:
+  ClangTidy:
+    Add: [bugprone-*, performance-*, readability-*]
+    Remove: [readability-magic-numbers]

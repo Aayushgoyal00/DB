@@ -72,6 +72,7 @@ Status LogManager::IterateAll(Visitor visit) {
   std::ifstream in(log_file_path_, std::ios::binary);
   if (!in) return Status::IOError("cannot open log for iteration: " + log_file_path_);
 
+  lsn_t cur_lsn = 1;
   while (true) {
     uint32_t body_len = 0;
     if (!in.read(reinterpret_cast<char*>(&body_len), 4)) break;  // EOF
@@ -95,6 +96,7 @@ Status LogManager::IterateAll(Visitor visit) {
     if (!LogRecord::Decode(body.data(), body.size(), &rec)) {
       return Status::Corruption("malformed log record");
     }
+    rec.lsn = cur_lsn++;
     visit(rec);
   }
   return Status::OK();

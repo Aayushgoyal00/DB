@@ -1,4 +1,8 @@
 {
+  "clangd.arguments": [
+    "--query-driver=C:/msys64/mingw64/bin/g++.exe"
+  ]
+}{
   "C_Cpp_Runner.cCompilerPath": "gcc",
   "C_Cpp_Runner.cppCompilerPath": "g++",
   "C_Cpp_Runner.debuggerPath": "gdb",

@@ -49,14 +49,17 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
   if (fid == INVALID_FRAME_ID) return nullptr;
 
   page_id_t old_pid = pages_[fid].GetPageId();
-  if (old_pid != INVALID_PAGE_ID && pages_[fid].IsDirty()) {
-    if (log_manager_ &&
-        pages_[fid].GetPageLSN() > log_manager_->GetFlushedLSN()) {
-      Status fs = log_manager_->Flush();
-      if (!fs.ok()) return nullptr;
+  if (old_pid != INVALID_PAGE_ID) {
+    if (pages_[fid].IsDirty()) {
+      if (log_manager_ &&
+          pages_[fid].GetPageLSN() > log_manager_->GetFlushedLSN()) {
+        Status fs = log_manager_->Flush();
+        if (!fs.ok()) return nullptr;
+      }
+      Status s = disk_manager_->WritePage(old_pid, pages_[fid].GetData());
+      if (!s.ok()) return nullptr;
     }
-    Status s = disk_manager_->WritePage(old_pid, pages_[fid].GetData());
-    if (!s.ok()) return nullptr;
+    page_table_.erase(old_pid);
   }
   replacer_->Remove(fid);
 
@@ -130,14 +133,17 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id_out) {
   if (fid == INVALID_FRAME_ID) return nullptr;
 
   page_id_t old_pid = pages_[fid].GetPageId();
-  if (old_pid != INVALID_PAGE_ID && pages_[fid].IsDirty()) {
-    if (log_manager_ &&
-        pages_[fid].GetPageLSN() > log_manager_->GetFlushedLSN()) {
-      Status fs = log_manager_->Flush();
-      if (!fs.ok()) return nullptr;
+  if (old_pid != INVALID_PAGE_ID) {
+    if (pages_[fid].IsDirty()) {
+      if (log_manager_ &&
+          pages_[fid].GetPageLSN() > log_manager_->GetFlushedLSN()) {
+        Status fs = log_manager_->Flush();
+        if (!fs.ok()) return nullptr;
+      }
+      Status s = disk_manager_->WritePage(old_pid, pages_[fid].GetData());
+      if (!s.ok()) return nullptr;
     }
-    Status s = disk_manager_->WritePage(old_pid, pages_[fid].GetData());
-    if (!s.ok()) return nullptr;
+    page_table_.erase(old_pid);
   }
   replacer_->Remove(fid);
 

@@ -4,11 +4,14 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <memory>
+#include <shared_mutex>
 
 #include "storage/page.h"
 #include "storage/slotted_page.h"
+#include "txn/recovery_manager.h"
 
 namespace dbengine {
 namespace {
@@ -88,49 +91,169 @@ class BPlusTreeEngine::IteratorImpl final : public Iterator {
 };
 
 BPlusTreeEngine::BPlusTreeEngine(DiskManager* disk_manager)
-    : disk_manager_(disk_manager), initialization_status_(InitializeOrLoadMetadata()) {}
+    : disk_manager_(disk_manager), bpm_(nullptr), log_manager_(nullptr),
+      initialization_status_(InitializeOrLoadMetadata()) {}
+
+BPlusTreeEngine::BPlusTreeEngine(BufferPoolManager* bpm, LogManager* log_manager,
+                                 bool recover_on_open)
+    : disk_manager_(nullptr), bpm_(bpm), log_manager_(log_manager),
+      initialization_status_(InitializeOrLoadMetadata()) {
+  if (!initialization_status_.ok()) return;
+  if (bpm_ == nullptr) {
+    initialization_status_ = Status::InvalidArgument(
+        "BPlusTreeEngine buffer-pool mode requires a non-null BPM");
+    return;
+  }
+  if (log_manager_ != nullptr && recover_on_open) {
+    Status s = Recover();
+    if (!s.ok()) {
+      initialization_status_ = s;
+      return;
+    }
+  }
+  recovered_ = (log_manager_ != nullptr);
+}
+
+BPlusTreeEngine::~BPlusTreeEngine() {
+  if (bpm_ != nullptr) {
+    MarkCleanShutdown();
+    if (log_manager_ != nullptr) {
+      log_manager_->Flush();
+    }
+    bpm_->FlushAllPages();
+  }
+}
 
 Status BPlusTreeEngine::InitializeOrLoadMetadata() {
-  if (disk_manager_ == nullptr) {
-    return Status::InvalidArgument("BPlusTreeEngine requires a DiskManager");
+  if (disk_manager_ == nullptr && bpm_ == nullptr) {
+    return Status::InvalidArgument("BPlusTreeEngine requires a DiskManager or BufferPoolManager");
   }
-  if (disk_manager_->GetNumPages() == 0) {
-    if (disk_manager_->AllocatePage() != 0) {
-      return Status::Corruption("metadata page was not allocated at page zero");
+  if (bpm_ == nullptr) {
+    // Direct-disk mode
+    if (disk_manager_->GetNumPages() == 0) {
+      if (disk_manager_->AllocatePage() != 0) {
+        return Status::Corruption("metadata page was not allocated at page zero");
+      }
+      Page page;
+      SlottedPage metadata(&page);
+      metadata.Initialize(PageType::kMeta);
+      std::array<char, 8> record{};
+      std::copy(kMetadataMagic.begin(), kMetadataMagic.end(), record.begin());
+      WriteU32(record.data() + 4, static_cast<uint32_t>(INVALID_PAGE_ID));
+      Status status = metadata.InsertCell(0, record);
+      if (!status.ok()) {
+        return status;
+      }
+      return disk_manager_->WritePage(0, page.GetData());
     }
+
     Page page;
+    Status status = disk_manager_->ReadPage(0, page.GetData());
+    if (!status.ok()) {
+      return status;
+    }
     SlottedPage metadata(&page);
+    if (metadata.GetPageType() != PageType::kMeta || !metadata.VerifyChecksum() ||
+        metadata.NumCells() != 1) {
+      return Status::Corruption("invalid B+Tree metadata page");
+    }
+    const std::span<const char> record = metadata.GetCell(0);
+    if (record.size() != 8 ||
+        !std::equal(kMetadataMagic.begin(), kMetadataMagic.end(), record.begin())) {
+      return Status::Corruption("invalid B+Tree metadata record");
+    }
+    root_page_id_ = static_cast<page_id_t>(ReadU32(record.data() + 4));
+    return Status::OK();
+  }
+
+  // BufferPoolManager mode
+  Page* page = bpm_->FetchPage(0);
+  if (page == nullptr) {
+    // Fresh database: page 0 needs to be created
+    page_id_t meta_pid;
+    page = bpm_->NewPage(&meta_pid);
+    if (page == nullptr || meta_pid != 0) {
+      return Status::IOError("BPM could not allocate metadata page 0");
+    }
+    SlottedPage metadata(page);
     metadata.Initialize(PageType::kMeta);
     std::array<char, 8> record{};
     std::copy(kMetadataMagic.begin(), kMetadataMagic.end(), record.begin());
     WriteU32(record.data() + 4, static_cast<uint32_t>(INVALID_PAGE_ID));
     Status status = metadata.InsertCell(0, record);
     if (!status.ok()) {
+      bpm_->UnpinPage(0, true);
       return status;
     }
-    return disk_manager_->WritePage(0, page.GetData());
+    page->SetPageLSN(next_txn_lsn_.fetch_add(1));
+    root_page_id_ = INVALID_PAGE_ID;
+    bpm_->UnpinPage(0, true);
+    return Status::OK();
   }
 
-  Page page;
-  Status status = disk_manager_->ReadPage(0, page.GetData());
-  if (!status.ok()) {
-    return status;
-  }
-  SlottedPage metadata(&page);
+  // Check if page 0 is empty / freshly allocated
+  SlottedPage metadata(page);
   if (metadata.GetPageType() != PageType::kMeta || !metadata.VerifyChecksum() ||
       metadata.NumCells() != 1) {
-    return Status::Corruption("invalid B+Tree metadata page");
+    // Uninitialized page 0
+    metadata.Initialize(PageType::kMeta);
+    std::array<char, 8> record{};
+    std::copy(kMetadataMagic.begin(), kMetadataMagic.end(), record.begin());
+    WriteU32(record.data() + 4, static_cast<uint32_t>(INVALID_PAGE_ID));
+    Status status = metadata.InsertCell(0, record);
+    if (!status.ok()) {
+      bpm_->UnpinPage(0, true);
+      return status;
+    }
+    page->SetPageLSN(next_txn_lsn_.fetch_add(1));
+    root_page_id_ = INVALID_PAGE_ID;
+    bpm_->UnpinPage(0, true);
+    return Status::OK();
   }
+
   const std::span<const char> record = metadata.GetCell(0);
   if (record.size() != 8 ||
       !std::equal(kMetadataMagic.begin(), kMetadataMagic.end(), record.begin())) {
-    return Status::Corruption("invalid B+Tree metadata record");
+    bpm_->UnpinPage(0, false);
+    return Status::Corruption("invalid B+Tree metadata record (BPM path)");
   }
   root_page_id_ = static_cast<page_id_t>(ReadU32(record.data() + 4));
+  bpm_->UnpinPage(0, false);
   return Status::OK();
 }
 
 Status BPlusTreeEngine::StoreRootPageId(page_id_t root_page_id) {
+  if (bpm_ != nullptr) {
+    Page* page = bpm_->FetchPage(0);
+    if (page == nullptr) return Status::IOError("BPM returned null for metadata page");
+    {
+      std::unique_lock<std::shared_mutex> wlock(page->Latch());
+      SlottedPage metadata(page);
+      if (metadata.GetPageType() != PageType::kMeta || !metadata.VerifyChecksum() ||
+          metadata.NumCells() != 1) {
+        bpm_->UnpinPage(0, false);
+        return Status::Corruption("cannot update invalid B+Tree metadata page");
+      }
+      std::array<char, 8> record{};
+      std::copy(kMetadataMagic.begin(), kMetadataMagic.end(), record.begin());
+      WriteU32(record.data() + 4, static_cast<uint32_t>(root_page_id));
+      Status status = metadata.DeleteCell(0);
+      if (!status.ok()) {
+        bpm_->UnpinPage(0, false);
+        return status;
+      }
+      status = metadata.InsertCell(0, record);
+      if (!status.ok()) {
+        bpm_->UnpinPage(0, false);
+        return status;
+      }
+      page->SetPageLSN(next_txn_lsn_.load());
+    }
+    bpm_->UnpinPage(0, true);
+    root_page_id_ = root_page_id;
+    return Status::OK();
+  }
+
   Page page;
   Status status = disk_manager_->ReadPage(0, page.GetData());
   if (!status.ok()) {
@@ -159,12 +282,83 @@ Status BPlusTreeEngine::StoreRootPageId(page_id_t root_page_id) {
   return status;
 }
 
+Status BPlusTreeEngine::AllocateNewPage(page_id_t* page_id_out) {
+  if (bpm_ != nullptr) {
+    Page* page = bpm_->NewPage(page_id_out);
+    if (page == nullptr) {
+      return Status::IOError("BPM failed to allocate new page");
+    }
+    bpm_->UnpinPage(*page_id_out, false);
+    return Status::OK();
+  }
+  *page_id_out = disk_manager_->AllocatePage();
+  return Status::OK();
+}
+
+Status BPlusTreeEngine::GetNodeType(page_id_t page_id, PageType* type_out) const {
+  if (bpm_ != nullptr) {
+    Page* page = bpm_->FetchPage(page_id);
+    if (page == nullptr) {
+      return Status::IOError("BPM fetch failed for page " + std::to_string(page_id));
+    }
+    {
+      std::shared_lock<std::shared_mutex> rlock(page->Latch());
+      SlottedPage slotted(page);
+      if (!slotted.VerifyChecksum()) {
+        bpm_->UnpinPage(page_id, false);
+        return Status::Corruption("checksum mismatch for page " + std::to_string(page_id));
+      }
+      *type_out = slotted.GetPageType();
+    }
+    bpm_->UnpinPage(page_id, false);
+    return Status::OK();
+  }
+
+  Page page;
+  Status status = disk_manager_->ReadPage(page_id, page.GetData());
+  if (!status.ok()) return status;
+  SlottedPage slotted(&page);
+  if (!slotted.VerifyChecksum()) {
+    return Status::Corruption("checksum mismatch for page " + std::to_string(page_id));
+  }
+  *type_out = slotted.GetPageType();
+  return Status::OK();
+}
+
 Status BPlusTreeEngine::ReadLeaf(page_id_t page_id,
                                   std::vector<LeafEntry>* entries,
                                   page_id_t* right_sibling_page_id) const {
   if (entries == nullptr || right_sibling_page_id == nullptr) {
     return Status::InvalidArgument("ReadLeaf requires output parameters");
   }
+  entries->clear();
+  if (bpm_ != nullptr) {
+    Page* page = bpm_->FetchPage(page_id);
+    if (page == nullptr) return Status::IOError("BPM returned null for leaf page");
+    Status status;
+    {
+      std::shared_lock<std::shared_mutex> rlock(page->Latch());
+      SlottedPage slotted(page);
+      if (slotted.GetPageType() != PageType::kLeaf || !slotted.VerifyChecksum()) {
+        bpm_->UnpinPage(page_id, false);
+        return Status::Corruption("invalid leaf page");
+      }
+      entries->reserve(slotted.NumCells());
+      for (uint16_t i = 0; i < slotted.NumCells(); ++i) {
+        LeafCell cell;
+        status = DecodeLeafCell(slotted.GetCell(i), &cell);
+        if (!status.ok()) {
+          bpm_->UnpinPage(page_id, false);
+          return status;
+        }
+        entries->push_back({std::move(cell.key), std::move(cell.value)});
+      }
+      *right_sibling_page_id = slotted.RightSiblingPageId();
+    }
+    bpm_->UnpinPage(page_id, false);
+    return Status::OK();
+  }
+
   Page page;
   Status status = disk_manager_->ReadPage(page_id, page.GetData());
   if (!status.ok()) {
@@ -174,7 +368,6 @@ Status BPlusTreeEngine::ReadLeaf(page_id_t page_id,
   if (slotted.GetPageType() != PageType::kLeaf || !slotted.VerifyChecksum()) {
     return Status::Corruption("invalid leaf page");
   }
-  entries->clear();
   entries->reserve(slotted.NumCells());
   for (uint16_t i = 0; i < slotted.NumCells(); ++i) {
     LeafCell cell;
@@ -191,6 +384,33 @@ Status BPlusTreeEngine::ReadLeaf(page_id_t page_id,
 Status BPlusTreeEngine::WriteLeaf(page_id_t page_id,
                                    const std::vector<LeafEntry>& entries,
                                    page_id_t right_sibling_page_id) {
+  if (bpm_ != nullptr) {
+    Page* page = bpm_->FetchPage(page_id);
+    if (page == nullptr) return Status::IOError("BPM returned null for leaf page");
+    Status status;
+    {
+      std::unique_lock<std::shared_mutex> wlock(page->Latch());
+      SlottedPage slotted(page);
+      slotted.Initialize(PageType::kLeaf, right_sibling_page_id);
+      for (uint16_t i = 0; i < entries.size(); ++i) {
+        std::vector<char> cell;
+        status = EncodeLeafCell(entries[i].key, entries[i].value, &cell);
+        if (!status.ok()) {
+          bpm_->UnpinPage(page_id, false);
+          return status;
+        }
+        status = slotted.InsertCell(i, cell);
+        if (!status.ok()) {
+          bpm_->UnpinPage(page_id, false);
+          return PageFull(status);
+        }
+      }
+      page->SetPageLSN(next_txn_lsn_.load());
+    }
+    bpm_->UnpinPage(page_id, true);
+    return Status::OK();
+  }
+
   Page page;
   SlottedPage slotted(&page);
   slotted.Initialize(PageType::kLeaf, right_sibling_page_id);
@@ -212,31 +432,61 @@ Status BPlusTreeEngine::ReadInternal(page_id_t page_id, InternalNodeData* node) 
   if (node == nullptr) {
     return Status::InvalidArgument("ReadInternal requires an output parameter");
   }
-  Page page;
-  Status status = disk_manager_->ReadPage(page_id, page.GetData());
-  if (!status.ok()) {
-    return status;
-  }
-  SlottedPage slotted(&page);
-  if (slotted.GetPageType() != PageType::kInternal || !slotted.VerifyChecksum()) {
-    return Status::Corruption("invalid internal page");
-  }
-  const page_id_t leftmost_child = slotted.RightSiblingPageId();
-  if (leftmost_child == INVALID_PAGE_ID) {
-    return Status::Corruption("internal page has no leftmost child");
-  }
   node->keys.clear();
   node->children.clear();
-  node->children.push_back(leftmost_child);
-  for (uint16_t i = 0; i < slotted.NumCells(); ++i) {
-    InternalCell cell;
-    status = DecodeInternalCell(slotted.GetCell(i), &cell);
-    if (!status.ok()) {
-      return status;
+  page_id_t leftmost_child = INVALID_PAGE_ID;
+
+  if (bpm_ != nullptr) {
+    Page* page = bpm_->FetchPage(page_id);
+    if (page == nullptr) return Status::IOError("BPM returned null for internal page");
+    Status status;
+    {
+      std::shared_lock<std::shared_mutex> rlock(page->Latch());
+      SlottedPage slotted(page);
+      if (slotted.GetPageType() != PageType::kInternal || !slotted.VerifyChecksum()) {
+        bpm_->UnpinPage(page_id, false);
+        return Status::Corruption("invalid internal page");
+      }
+      leftmost_child = slotted.RightSiblingPageId();
+      if (leftmost_child == INVALID_PAGE_ID) {
+        bpm_->UnpinPage(page_id, false);
+        return Status::Corruption("internal page has no leftmost child");
+      }
+      node->children.push_back(leftmost_child);
+      for (uint16_t i = 0; i < slotted.NumCells(); ++i) {
+        InternalCell cell;
+        status = DecodeInternalCell(slotted.GetCell(i), &cell);
+        if (!status.ok()) {
+          bpm_->UnpinPage(page_id, false);
+          return status;
+        }
+        node->keys.push_back(std::move(cell.key));
+        node->children.push_back(cell.child_page_id);
+      }
     }
-    node->keys.push_back(std::move(cell.key));
-    node->children.push_back(cell.child_page_id);
+    bpm_->UnpinPage(page_id, false);
+  } else {
+    Page page;
+    Status status = disk_manager_->ReadPage(page_id, page.GetData());
+    if (!status.ok()) return status;
+    SlottedPage slotted(&page);
+    if (slotted.GetPageType() != PageType::kInternal || !slotted.VerifyChecksum()) {
+      return Status::Corruption("invalid internal page");
+    }
+    leftmost_child = slotted.RightSiblingPageId();
+    if (leftmost_child == INVALID_PAGE_ID) {
+      return Status::Corruption("internal page has no leftmost child");
+    }
+    node->children.push_back(leftmost_child);
+    for (uint16_t i = 0; i < slotted.NumCells(); ++i) {
+      InternalCell cell;
+      status = DecodeInternalCell(slotted.GetCell(i), &cell);
+      if (!status.ok()) return status;
+      node->keys.push_back(std::move(cell.key));
+      node->children.push_back(cell.child_page_id);
+    }
   }
+
   if (node->children.size() != node->keys.size() + 1 ||
       !std::is_sorted(node->keys.begin(), node->keys.end())) {
     return Status::Corruption("internal page has invalid separators");
@@ -248,10 +498,35 @@ Status BPlusTreeEngine::WriteInternal(page_id_t page_id, const InternalNodeData&
   if (node.children.size() != node.keys.size() + 1 || node.children.empty()) {
     return Status::InvalidArgument("internal node has invalid child count");
   }
+  if (bpm_ != nullptr) {
+    Page* page = bpm_->FetchPage(page_id);
+    if (page == nullptr) return Status::IOError("BPM returned null for internal page");
+    Status status;
+    {
+      std::unique_lock<std::shared_mutex> wlock(page->Latch());
+      SlottedPage slotted(page);
+      slotted.Initialize(PageType::kInternal, node.children.front());
+      for (uint16_t i = 0; i < node.keys.size(); ++i) {
+        std::vector<char> cell;
+        status = EncodeInternalCell(node.keys[i], node.children[i + 1], &cell);
+        if (!status.ok()) {
+          bpm_->UnpinPage(page_id, false);
+          return status;
+        }
+        status = slotted.InsertCell(i, cell);
+        if (!status.ok()) {
+          bpm_->UnpinPage(page_id, false);
+          return PageFull(status);
+        }
+      }
+      page->SetPageLSN(next_txn_lsn_.load());
+    }
+    bpm_->UnpinPage(page_id, true);
+    return Status::OK();
+  }
+
   Page page;
   SlottedPage slotted(&page);
-  // For internal pages this header field stores the leftmost child. Leaf pages
-  // use the same bytes as their right-sibling pointer.
   slotted.Initialize(PageType::kInternal, node.children.front());
   for (uint16_t i = 0; i < node.keys.size(); ++i) {
     std::vector<char> cell;
@@ -276,30 +551,234 @@ Status BPlusTreeEngine::FindLeaf(const std::string& key, page_id_t* leaf_page_id
   }
   page_id_t current = root_page_id_;
   while (true) {
-    Page page;
-    Status status = disk_manager_->ReadPage(current, page.GetData());
-    if (!status.ok()) {
-      return status;
+    PageType type = PageType::kUninitialized;
+    if (bpm_ != nullptr) {
+      Page* page = bpm_->FetchPage(current);
+      if (page == nullptr) return Status::IOError("BPM returned null during FindLeaf");
+      page_id_t next = current;
+      {
+        std::shared_lock<std::shared_mutex> rlock(page->Latch());
+        SlottedPage slotted(page);
+        if (!slotted.VerifyChecksum()) {
+          bpm_->UnpinPage(current, false);
+          return Status::Corruption("page checksum mismatch during search");
+        }
+        type = slotted.GetPageType();
+        if (type == PageType::kLeaf) {
+          *leaf_page_id = current;
+          bpm_->UnpinPage(current, false);
+          return Status::OK();
+        }
+        if (type != PageType::kInternal) {
+          bpm_->UnpinPage(current, false);
+          return Status::Corruption("non-tree page reached during search");
+        }
+        const page_id_t leftmost = slotted.RightSiblingPageId();
+        std::vector<std::string> keys;
+        std::vector<page_id_t> children;
+        children.push_back(leftmost);
+        for (uint16_t i = 0; i < slotted.NumCells(); ++i) {
+          InternalCell cell;
+          Status ds = DecodeInternalCell(slotted.GetCell(i), &cell);
+          if (!ds.ok()) {
+            bpm_->UnpinPage(current, false);
+            return ds;
+          }
+          keys.push_back(std::move(cell.key));
+          children.push_back(cell.child_page_id);
+        }
+        const auto it = std::upper_bound(keys.begin(), keys.end(), key);
+        next = children[static_cast<std::size_t>(it - keys.begin())];
+      }
+      bpm_->UnpinPage(current, false);
+      current = next;
+    } else {
+      Page page;
+      Status status = disk_manager_->ReadPage(current, page.GetData());
+      if (!status.ok()) {
+        return status;
+      }
+      SlottedPage slotted(&page);
+      if (!slotted.VerifyChecksum()) {
+        return Status::Corruption("page checksum mismatch during search");
+      }
+      type = slotted.GetPageType();
+      if (type == PageType::kLeaf) {
+        *leaf_page_id = current;
+        return Status::OK();
+      }
+      if (type != PageType::kInternal) {
+        return Status::Corruption("non-tree page reached during search");
+      }
+      InternalNodeData internal;
+      status = ReadInternal(current, &internal);
+      if (!status.ok()) {
+        return status;
+      }
+      const auto it = std::upper_bound(internal.keys.begin(), internal.keys.end(), key);
+      current = internal.children[static_cast<std::size_t>(it - internal.keys.begin())];
     }
-    SlottedPage slotted(&page);
-    if (!slotted.VerifyChecksum()) {
-      return Status::Corruption("page checksum mismatch during search");
+  }
+}
+
+Status BPlusTreeEngine::InsertRecursive(page_id_t page_id, const std::string& key,
+                                         const std::string& value,
+                                         std::optional<Split>* split_out) {
+  *split_out = std::nullopt;
+  PageType type = PageType::kUninitialized;
+  Status s = GetNodeType(page_id, &type);
+  if (!s.ok()) return s;
+
+  if (type == PageType::kLeaf) {
+    std::vector<LeafEntry> entries;
+    page_id_t sibling = INVALID_PAGE_ID;
+    Status status = ReadLeaf(page_id, &entries, &sibling);
+    if (!status.ok()) return status;
+
+    const auto it = std::lower_bound(entries.begin(), entries.end(), key,
+                                     [](const LeafEntry& entry, const std::string& val) {
+                                       return entry.key < val;
+                                     });
+    if (it != entries.end() && it->key == key) {
+      it->value = value;
+    } else {
+      entries.insert(it, {key, value});
     }
-    if (slotted.GetPageType() == PageType::kLeaf) {
-      *leaf_page_id = current;
+
+    status = WriteLeaf(page_id, entries, sibling);
+    if (status.ok()) {
       return Status::OK();
     }
-    if (slotted.GetPageType() != PageType::kInternal) {
-      return Status::Corruption("non-tree page reached during search");
-    }
-    InternalNodeData internal;
-    status = ReadInternal(current, &internal);
-    if (!status.ok()) {
+    if (status.code() != Status::Code::kInvalidArgument || entries.size() < 2) {
       return status;
     }
-    const auto it = std::upper_bound(internal.keys.begin(), internal.keys.end(), key);
-    current = internal.children[static_cast<std::size_t>(it - internal.keys.begin())];
+
+    const std::size_t split_at = entries.size() / 2;
+    std::vector<LeafEntry> right_entries(
+        std::make_move_iterator(entries.begin() + static_cast<std::ptrdiff_t>(split_at)),
+        std::make_move_iterator(entries.end()));
+    entries.resize(split_at);
+
+    page_id_t right_page_id;
+    status = AllocateNewPage(&right_page_id);
+    if (!status.ok()) return status;
+
+    status = WriteLeaf(page_id, entries, right_page_id);
+    if (!status.ok()) return status;
+
+    status = WriteLeaf(right_page_id, right_entries, sibling);
+    if (!status.ok()) return status;
+
+    *split_out = Split{right_entries.front().key, right_page_id};
+    return Status::OK();
   }
+
+  if (type != PageType::kInternal) {
+    return Status::Corruption("non-tree page reached during insert");
+  }
+
+  InternalNodeData internal;
+  Status status = ReadInternal(page_id, &internal);
+  if (!status.ok()) return status;
+
+  const auto child_it = std::upper_bound(internal.keys.begin(), internal.keys.end(), key);
+  const std::size_t child_index = static_cast<std::size_t>(child_it - internal.keys.begin());
+  std::optional<Split> child_split;
+  status = InsertRecursive(internal.children[child_index], key, value, &child_split);
+  if (!status.ok() || !child_split) {
+    return status;
+  }
+
+  internal.keys.insert(internal.keys.begin() + static_cast<std::ptrdiff_t>(child_index),
+                       std::move(child_split->separator));
+  internal.children.insert(
+      internal.children.begin() + static_cast<std::ptrdiff_t>(child_index + 1),
+      child_split->right_page_id);
+
+  status = WriteInternal(page_id, internal);
+  if (status.ok()) {
+    return Status::OK();
+  }
+  if (status.code() != Status::Code::kInvalidArgument || internal.keys.size() < 2) {
+    return status;
+  }
+
+  const std::size_t promote_index = internal.keys.size() / 2;
+  const std::string separator = internal.keys[promote_index];
+  InternalNodeData right;
+  right.keys.assign(std::make_move_iterator(internal.keys.begin() +
+                                             static_cast<std::ptrdiff_t>(promote_index + 1)),
+                    std::make_move_iterator(internal.keys.end()));
+  right.children.assign(std::make_move_iterator(internal.children.begin() +
+                                                 static_cast<std::ptrdiff_t>(promote_index + 1)),
+                        std::make_move_iterator(internal.children.end()));
+  internal.keys.resize(promote_index);
+  internal.children.resize(promote_index + 1);
+
+  page_id_t right_page_id;
+  status = AllocateNewPage(&right_page_id);
+  if (!status.ok()) return status;
+
+  status = WriteInternal(page_id, internal);
+  if (!status.ok()) return status;
+
+  status = WriteInternal(right_page_id, right);
+  if (!status.ok()) return status;
+
+  *split_out = Split{separator, right_page_id};
+  return Status::OK();
+}
+
+Status BPlusTreeEngine::PutUnlogged(const std::string& key, const std::string& value) {
+  if (root_page_id_ == INVALID_PAGE_ID) {
+    page_id_t root_page_id;
+    Status status = AllocateNewPage(&root_page_id);
+    if (!status.ok()) return status;
+
+    status = WriteLeaf(root_page_id, {{key, value}}, INVALID_PAGE_ID);
+    if (!status.ok()) return status;
+
+    return StoreRootPageId(root_page_id);
+  }
+
+  std::optional<Split> split;
+  Status status = InsertRecursive(root_page_id_, key, value, &split);
+  if (!status.ok() || !split) {
+    return status;
+  }
+
+  page_id_t new_root_page_id;
+  status = AllocateNewPage(&new_root_page_id);
+  if (!status.ok()) return status;
+
+  InternalNodeData root{{split->separator}, {root_page_id_, split->right_page_id}};
+  status = WriteInternal(new_root_page_id, root);
+  if (!status.ok()) return status;
+
+  return StoreRootPageId(new_root_page_id);
+}
+
+Status BPlusTreeEngine::DeleteUnlogged(const std::string& key) {
+  page_id_t leaf_page_id;
+  Status status = FindLeaf(key, &leaf_page_id);
+  if (!status.ok()) {
+    return status;
+  }
+  std::vector<LeafEntry> entries;
+  page_id_t sibling;
+  status = ReadLeaf(leaf_page_id, &entries, &sibling);
+  if (!status.ok()) {
+    return status;
+  }
+  const auto it = std::lower_bound(entries.begin(), entries.end(), key,
+                                   [](const LeafEntry& entry, const std::string& val) {
+                                     return entry.key < val;
+                                   });
+  if (it == entries.end() || it->key != key) {
+    return Status::NotFound("key not found");
+  }
+  entries.erase(it);
+  return WriteLeaf(leaf_page_id, entries, sibling);
 }
 
 Status BPlusTreeEngine::Get(const std::string& key, std::string* value_out) {
@@ -321,8 +800,8 @@ Status BPlusTreeEngine::Get(const std::string& key, std::string* value_out) {
     return status;
   }
   const auto it = std::lower_bound(entries.begin(), entries.end(), key,
-                                   [](const LeafEntry& entry, const std::string& value) {
-                                     return entry.key < value;
+                                   [](const LeafEntry& entry, const std::string& val) {
+                                     return entry.key < val;
                                    });
   if (it == entries.end() || it->key != key) {
     return Status::NotFound("key not found");
@@ -331,164 +810,187 @@ Status BPlusTreeEngine::Get(const std::string& key, std::string* value_out) {
   return Status::OK();
 }
 
-Status BPlusTreeEngine::InsertRecursive(page_id_t page_id, const std::string& key,
-                                         const std::string& value,
-                                         std::optional<Split>* split_out) {
-  *split_out = std::nullopt;
-  Page page;
-  Status status = disk_manager_->ReadPage(page_id, page.GetData());
-  if (!status.ok()) {
-    return status;
-  }
-  SlottedPage slotted(&page);
-  if (!slotted.VerifyChecksum()) {
-    return Status::Corruption("page checksum mismatch during insert");
-  }
-  if (slotted.GetPageType() == PageType::kLeaf) {
-    std::vector<LeafEntry> entries;
-    page_id_t sibling;
-    status = ReadLeaf(page_id, &entries, &sibling);
-    if (!status.ok()) {
-      return status;
-    }
-    const auto it = std::lower_bound(entries.begin(), entries.end(), key,
-                                     [](const LeafEntry& entry, const std::string& value) {
-                                       return entry.key < value;
-                                     });
-    if (it != entries.end() && it->key == key) {
-      it->value = value;
-    } else {
-      entries.insert(it, {key, value});
-    }
-    status = WriteLeaf(page_id, entries, sibling);
-    if (status.ok()) {
-      return status;
-    }
-    if (status.code() != Status::Code::kInvalidArgument || entries.size() < 2) {
-      return status;
-    }
-    const std::size_t split_at = entries.size() / 2;
-    std::vector<LeafEntry> right_entries(
-        std::make_move_iterator(entries.begin() + static_cast<std::ptrdiff_t>(split_at)),
-        std::make_move_iterator(entries.end()));
-    entries.resize(split_at);
-    const page_id_t right_page_id = disk_manager_->AllocatePage();
-    status = WriteLeaf(page_id, entries, right_page_id);
-    if (!status.ok()) {
-      return status;
-    }
-    status = WriteLeaf(right_page_id, right_entries, sibling);
-    if (!status.ok()) {
-      return status;
-    }
-    *split_out = Split{right_entries.front().key, right_page_id};
-    return Status::OK();
-  }
-  if (slotted.GetPageType() != PageType::kInternal) {
-    return Status::Corruption("non-tree page reached during insert");
-  }
-
-  InternalNodeData internal;
-  status = ReadInternal(page_id, &internal);
-  if (!status.ok()) {
-    return status;
-  }
-  const auto child_it = std::upper_bound(internal.keys.begin(), internal.keys.end(), key);
-  const std::size_t child_index =
-      static_cast<std::size_t>(child_it - internal.keys.begin());
-  std::optional<Split> child_split;
-  status = InsertRecursive(internal.children[child_index], key, value, &child_split);
-  if (!status.ok() || !child_split) {
-    return status;
-  }
-  internal.keys.insert(internal.keys.begin() + static_cast<std::ptrdiff_t>(child_index),
-                       std::move(child_split->separator));
-  internal.children.insert(
-      internal.children.begin() + static_cast<std::ptrdiff_t>(child_index + 1),
-      child_split->right_page_id);
-  status = WriteInternal(page_id, internal);
-  if (status.ok()) {
-    return status;
-  }
-  if (status.code() != Status::Code::kInvalidArgument || internal.keys.size() < 2) {
-    return status;
-  }
-  const std::size_t promote_index = internal.keys.size() / 2;
-  const std::string separator = internal.keys[promote_index];
-  InternalNodeData right;
-  right.keys.assign(std::make_move_iterator(internal.keys.begin() +
-                                             static_cast<std::ptrdiff_t>(promote_index + 1)),
-                    std::make_move_iterator(internal.keys.end()));
-  right.children.assign(std::make_move_iterator(internal.children.begin() +
-                                                 static_cast<std::ptrdiff_t>(promote_index + 1)),
-                        std::make_move_iterator(internal.children.end()));
-  internal.keys.resize(promote_index);
-  internal.children.resize(promote_index + 1);
-  const page_id_t right_page_id = disk_manager_->AllocatePage();
-  status = WriteInternal(page_id, internal);
-  if (!status.ok()) {
-    return status;
-  }
-  status = WriteInternal(right_page_id, right);
-  if (!status.ok()) {
-    return status;
-  }
-  *split_out = Split{separator, right_page_id};
-  return Status::OK();
-}
-
 Status BPlusTreeEngine::Put(const std::string& key, const std::string& value) {
   if (!initialization_status_.ok()) {
     return initialization_status_;
   }
-  if (root_page_id_ == INVALID_PAGE_ID) {
-    const page_id_t root_page_id = disk_manager_->AllocatePage();
-    Status status = WriteLeaf(root_page_id, {{key, value}}, INVALID_PAGE_ID);
-    if (!status.ok()) {
-      return status;
-    }
-    return StoreRootPageId(root_page_id);
-  }
-  std::optional<Split> split;
-  Status status = InsertRecursive(root_page_id_, key, value, &split);
-  if (!status.ok() || !split) {
-    return status;
-  }
-  const page_id_t new_root_page_id = disk_manager_->AllocatePage();
-  InternalNodeData root{{split->separator}, {root_page_id_, split->right_page_id}};
-  status = WriteInternal(new_root_page_id, root);
+  auto txn = BeginTransaction();
+  Status status = Put(txn.get(), key, value);
   if (!status.ok()) {
+    Abort(txn.get());
     return status;
   }
-  return StoreRootPageId(new_root_page_id);
+  return Commit(txn.get());
 }
 
 Status BPlusTreeEngine::Delete(const std::string& key) {
   if (!initialization_status_.ok()) {
     return initialization_status_;
   }
-  page_id_t leaf_page_id;
-  Status status = FindLeaf(key, &leaf_page_id);
+  auto txn = BeginTransaction();
+  Status status = Delete(txn.get(), key);
   if (!status.ok()) {
+    Abort(txn.get());
     return status;
   }
-  std::vector<LeafEntry> entries;
-  page_id_t sibling;
-  status = ReadLeaf(leaf_page_id, &entries, &sibling);
-  if (!status.ok()) {
-    return status;
+  return Commit(txn.get());
+}
+
+std::unique_ptr<Transaction> BPlusTreeEngine::BeginTransaction() {
+  txn_id_t tid = next_txn_id_.fetch_add(1);
+  auto txn = std::make_unique<Transaction>(tid);
+  if (log_manager_ != nullptr) {
+    LogRecord rec = MakeBeginRecord(tid);
+    rec.lsn = next_txn_lsn_.fetch_add(1);
+    log_manager_->Append(&rec);
+    txn->SetPrevLSN(rec.lsn);
   }
-  const auto it = std::lower_bound(entries.begin(), entries.end(), key,
-                                   [](const LeafEntry& entry, const std::string& value) {
-                                     return entry.key < value;
-                                   });
-  if (it == entries.end() || it->key != key) {
-    return Status::NotFound("key not found");
+  return txn;
+}
+
+Status BPlusTreeEngine::Get(Transaction* txn, const std::string& key, std::string* value_out) {
+  if (txn != nullptr) {
+    Status s = lock_manager_.AcquireShared(txn, key);
+    if (!s.ok()) return s;
   }
-  entries.erase(it);
-  // Rebalancing and page reclamation after a tree delete are deferred. The
-  // storage free-list is nevertheless available to merge/vacuum code.
-  return WriteLeaf(leaf_page_id, entries, sibling);
+  return Get(key, value_out);
+}
+
+Status BPlusTreeEngine::Put(Transaction* txn, const std::string& key, const std::string& value) {
+  if (txn != nullptr) {
+    Status s = lock_manager_.AcquireExclusive(txn, key);
+    if (!s.ok()) return s;
+
+    std::string old_val;
+    Status gs = Get(key, &old_val);
+    page_id_t leaf_pid = INVALID_PAGE_ID;
+    FindLeaf(key, &leaf_pid);
+    std::string before_image = gs.ok() ? old_val : "";
+    txn->AppendUndoRecord(leaf_pid, key, before_image);
+
+    if (log_manager_ != nullptr) {
+      LogRecord rec;
+      if (gs.ok()) {
+        rec = MakeUpdateRecord(txn->GetTxnId(), leaf_pid, key, old_val, value);
+      } else {
+        rec = MakeInsertRecord(txn->GetTxnId(), leaf_pid, key, value);
+      }
+      rec.lsn = next_txn_lsn_.fetch_add(1);
+      log_manager_->Append(&rec);
+      txn->SetPrevLSN(rec.lsn);
+    }
+  }
+  return PutUnlogged(key, value);
+}
+
+Status BPlusTreeEngine::Delete(Transaction* txn, const std::string& key) {
+  if (txn != nullptr) {
+    Status s = lock_manager_.AcquireExclusive(txn, key);
+    if (!s.ok()) return s;
+
+    std::string old_val;
+    Status gs = Get(key, &old_val);
+    if (!gs.ok()) return gs;
+
+    page_id_t leaf_pid = INVALID_PAGE_ID;
+    FindLeaf(key, &leaf_pid);
+    txn->AppendUndoRecord(leaf_pid, key, old_val);
+
+    if (log_manager_ != nullptr) {
+      LogRecord rec = MakeDeleteRecord(txn->GetTxnId(), leaf_pid, key, old_val);
+      rec.lsn = next_txn_lsn_.fetch_add(1);
+      log_manager_->Append(&rec);
+      txn->SetPrevLSN(rec.lsn);
+    }
+  }
+  return DeleteUnlogged(key);
+}
+
+Status BPlusTreeEngine::Commit(Transaction* txn) {
+  if (txn == nullptr) {
+    return Status::InvalidArgument("txn must not be null");
+  }
+  if (txn->GetState() != TransactionState::kGrowing &&
+      txn->GetState() != TransactionState::kShrinking) {
+    return Status::InvalidArgument("transaction is not active");
+  }
+  if (log_manager_ != nullptr) {
+    LogRecord rec = MakeCommitRecord(txn->GetTxnId());
+    rec.lsn = next_txn_lsn_.fetch_add(1);
+    Status as = log_manager_->AppendAndFlush(&rec);
+    if (!as.ok()) return as;
+  }
+  lock_manager_.ReleaseAll(txn);
+  txn->SetState(TransactionState::kCommitted);
+  txn->ClearUndoRecords();
+  return Status::OK();
+}
+
+Status BPlusTreeEngine::Abort(Transaction* txn) {
+  if (txn == nullptr) {
+    return Status::InvalidArgument("txn must not be null");
+  }
+  if (txn->GetState() != TransactionState::kGrowing &&
+      txn->GetState() != TransactionState::kShrinking) {
+    return Status::InvalidArgument("transaction is not active");
+  }
+  // Rollback in reverse order
+  const auto& undos = txn->GetUndoRecords();
+  for (auto it = undos.rbegin(); it != undos.rend(); ++it) {
+    if (it->before_image.empty()) {
+      DeleteUnlogged(it->key);
+    } else {
+      PutUnlogged(it->key, it->before_image);
+    }
+  }
+  if (log_manager_ != nullptr) {
+    LogRecord rec = MakeAbortRecord(txn->GetTxnId());
+    rec.lsn = next_txn_lsn_.fetch_add(1);
+    log_manager_->AppendAndFlush(&rec);
+  }
+  lock_manager_.ReleaseAll(txn);
+  txn->SetState(TransactionState::kAborted);
+  txn->ClearUndoRecords();
+  return Status::OK();
+}
+
+Status BPlusTreeEngine::Redo(page_id_t /*page_id*/, const std::string& key,
+                            const std::string& after_image) {
+  if (after_image.empty()) {
+    DeleteUnlogged(key);
+  } else {
+    PutUnlogged(key, after_image);
+  }
+  return Status::OK();
+}
+
+Status BPlusTreeEngine::Undo(page_id_t /*page_id*/, const std::string& key,
+                            const std::string& before_image) {
+  if (before_image.empty()) {
+    DeleteUnlogged(key);
+  } else {
+    PutUnlogged(key, before_image);
+  }
+  return Status::OK();
+}
+
+Status BPlusTreeEngine::Recover() {
+  if (recovered_) return Status::OK();
+  if (log_manager_ == nullptr) {
+    recovered_ = true;
+    return Status::OK();
+  }
+  RecoveryManager rm(log_manager_, this);
+  Status s = rm.Recover();
+  if (s.ok()) {
+    recovered_ = true;
+  }
+  return s;
+}
+
+Status BPlusTreeEngine::MarkCleanShutdown() {
+  recovered_ = true;
+  return Status::OK();
 }
 
 std::unique_ptr<Iterator> BPlusTreeEngine::Scan(const std::string& start_key) {
@@ -505,8 +1007,8 @@ std::unique_ptr<Iterator> BPlusTreeEngine::Scan(const std::string& start_key) {
     return std::make_unique<IteratorImpl>(this, INVALID_PAGE_ID, 0);
   }
   const auto it = std::lower_bound(entries.begin(), entries.end(), start_key,
-                                   [](const LeafEntry& entry, const std::string& value) {
-                                     return entry.key < value;
+                                   [](const LeafEntry& entry, const std::string& val) {
+                                     return entry.key < val;
                                    });
   return std::make_unique<IteratorImpl>(
       this, leaf_page_id, static_cast<std::size_t>(it - entries.begin()));
@@ -522,17 +1024,14 @@ bool BPlusTreeEngine::ValidatePage(page_id_t page_id, std::size_t depth,
     }
     return false;
   };
-  Page page;
-  if (!disk_manager_->ReadPage(page_id, page.GetData()).ok()) {
-    return fail("cannot read tree page");
-  }
-  SlottedPage slotted(&page);
-  if (!slotted.VerifyChecksum()) {
-    return fail("tree page checksum mismatch");
-  }
-  if (slotted.GetPageType() == PageType::kLeaf) {
+
+  PageType type = PageType::kUninitialized;
+  Status s = GetNodeType(page_id, &type);
+  if (!s.ok()) return fail("cannot read tree page type");
+
+  if (type == PageType::kLeaf) {
     std::vector<LeafEntry> entries;
-    page_id_t sibling;
+    page_id_t sibling = INVALID_PAGE_ID;
     if (!ReadLeaf(page_id, &entries, &sibling).ok()) {
       return fail("invalid leaf page");
     }
@@ -553,7 +1052,7 @@ bool BPlusTreeEngine::ValidatePage(page_id_t page_id, std::size_t depth,
     *expected_leaf_page_id = sibling;
     return true;
   }
-  if (slotted.GetPageType() != PageType::kInternal) {
+  if (type != PageType::kInternal) {
     return fail("unexpected page type in tree");
   }
   InternalNodeData internal;
@@ -597,18 +1096,16 @@ std::size_t BPlusTreeEngine::Height() const {
   page_id_t current = root_page_id_;
   while (current != INVALID_PAGE_ID) {
     ++height;
-    Page page;
-    if (!disk_manager_->ReadPage(current, page.GetData()).ok()) {
-      return 0;
-    }
-    SlottedPage slotted(&page);
-    if (!slotted.VerifyChecksum() || slotted.GetPageType() == PageType::kLeaf) {
-      return slotted.GetPageType() == PageType::kLeaf ? height : 0;
-    }
-    if (slotted.GetPageType() != PageType::kInternal) {
-      return 0;
-    }
-    current = slotted.RightSiblingPageId();
+    PageType type = PageType::kUninitialized;
+    Status s = GetNodeType(current, &type);
+    if (!s.ok()) return 0;
+    if (type == PageType::kLeaf) return height;
+    if (type != PageType::kInternal) return 0;
+
+    InternalNodeData internal;
+    s = ReadInternal(current, &internal);
+    if (!s.ok() || internal.children.empty()) return 0;
+    current = internal.children.front();
   }
   return 0;
 }

@@ -1,5 +1,7 @@
 #include "txn/recovery_manager.h"
 
+#include <limits>
+
 namespace dbengine {
 
 RecoveryManager::RecoveryManager(LogManager* log_manager, RecoveryTarget* target)
@@ -26,14 +28,20 @@ Status RecoveryManager::AnalysisPass() {
         active_txn_table_[r.txn_id] = r.lsn;
         break;
       case LogRecordType::kCommit:
+        active_txn_set_.erase(r.txn_id);
+        active_txn_table_.erase(r.txn_id);
+        committed_txn_set_.insert(r.txn_id);
+        break;
       case LogRecordType::kAbort:
         active_txn_set_.erase(r.txn_id);
         active_txn_table_.erase(r.txn_id);
+        aborted_txn_set_.insert(r.txn_id);
         break;
       case LogRecordType::kInsert:
       case LogRecordType::kUpdate:
       case LogRecordType::kDelete:
-        if (!active_txn_table_.count(r.txn_id)) {
+        if (!active_txn_table_.count(r.txn_id) && !committed_txn_set_.count(r.txn_id) &&
+            !aborted_txn_set_.count(r.txn_id)) {
           // Implicit txn start — happens if Begin was lost in a torn write.
           active_txn_set_.insert(r.txn_id);
         }
@@ -58,11 +66,12 @@ Status RecoveryManager::RedoPass() {
   // applied" optimization (would need a per-page last-applied-LSN) — we
   // trust that Redo's effect is idempotent enough at the engine layer
   // (it is, for our slotted-page model).
-  lsn_t min_rec_lsn = INVALID_LSN;
+  if (dirty_page_table_.empty()) return Status::OK();  // nothing dirty
+
+  lsn_t min_rec_lsn = std::numeric_limits<lsn_t>::max();
   for (const auto& [pid, rec] : dirty_page_table_) {
     if (rec < min_rec_lsn) min_rec_lsn = rec;
   }
-  if (min_rec_lsn == INVALID_LSN) return Status::OK();  // nothing dirty
 
   Status first = Status::OK();
   log_manager_->IterateAll([this, min_rec_lsn, &first](const LogRecord& r) {
@@ -79,15 +88,18 @@ Status RecoveryManager::RedoPass() {
 }
 
 Status RecoveryManager::UndoPass() {
-  // For every txn still active, walk its record chain backward applying
+  // For every txn still active or aborted, walk its record chain backward applying
   // before-images. This is where uncommitted work gets rolled back.
   Status first = Status::OK();
-  for (txn_id_t txn_id : active_txn_set_) {
+  std::unordered_set<txn_id_t> txns_to_undo;
+  for (txn_id_t tid : active_txn_set_) txns_to_undo.insert(tid);
+  for (txn_id_t tid : aborted_txn_set_) txns_to_undo.insert(tid);
+
+  for (txn_id_t txn_id : txns_to_undo) {
     auto it = txn_chains_.find(txn_id);
     if (it == txn_chains_.end()) continue;
     const auto& chain = it->second;
     for (auto rit = chain.rbegin(); rit != chain.rend(); ++rit) {
-      if (rit->page_id == INVALID_PAGE_ID) continue;
       Status s = target_->Undo(rit->page_id, rit->key, rit->before_image);
       if (!s.ok() && first.ok()) first = s;
     }

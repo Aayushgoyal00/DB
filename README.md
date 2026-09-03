@@ -73,6 +73,13 @@ The engine is built around strict separation of concerns across four core subsys
 * **Pluggable Interface:** Implements `KVStore` (`Get`, `Put`, `Delete`, `Scan`).
 * **Node Splitting & Free-List Recycling:** Dynamically balances leaf and internal nodes on overflow, cascading separator keys up to a new root. Deallocated pages are tracked via an in-file free list to prevent disk space leaks.
 * **Sequential Leaf Sibling Pointers:** Leaf nodes maintain right-sibling page references, enabling $O(\log N + K)$ range scans without re-traversing internal index levels.
+* **Two-Mode Construction:** `BPlusTreeEngine(disk_manager)` for direct-disk access (used by Phase 0–2 tests and `dump_tree`) and `BPlusTreeEngine(bpm, log_manager, recover_on_open)` for the Phase 3 stack with caching, WAL, and ARIES-lite recovery on startup.
+
+### 5. Transactional Engine & Concurrency Control
+* **Key-Level Two-Phase Locking:** `LockManager` in `txn/` grants shared (`S`) or exclusive (`X`) locks per key, with FIFO request queues and in-place S→X upgrades so an upgrading transaction doesn't deadlock on its own shared lock.
+* **ACID Lifecycle:** `BeginTransaction` allocates a `txn_id`, returns a `Transaction` handle. `Put` / `Delete` acquire exclusive locks and append WAL records; `Get` acquires shared locks. `Commit` flushes the WAL (`AppendAndFlush`) and releases all locks. `Abort` applies before-images in reverse order, writes the `kAbort` record, and releases locks.
+* **Page-Level Latching:** Each `Page` carries a `std::shared_mutex`; readers acquire shared latches, writers exclusive ones, around page-bytes manipulation.
+* **Multi-Threaded Safety:** An engine-level `tree_latch_` serializes tree-wide structural changes (root splits, page allocation, metadata updates) while per-page latches allow concurrent access to different nodes.
 
 ---
 
@@ -94,9 +101,10 @@ silt/
     storage/       page.h, disk_manager.h, slotted_page.h, replacer.h,
                    buffer_pool_manager.h, log_manager.h, log_record.h
     index/         kv_store.h (interface), bplus_tree_engine.h
-    txn/           recovery_manager.h (ARIES-lite)
+    txn/           transaction.h, lock_manager.h, recovery_manager.h (ARIES-lite)
   src/             Implementation files mirroring include/ structure
-  tests/           Modular test suites (disk manager, slotted page, B+Tree)
+  tests/           Modular test suites (disk manager, slotted page, B+Tree,
+                   buffer pool, WAL/recovery, BPM B+Tree, transactions, crash recovery)
   tools/           dump_tree.cpp (On-disk inspection diagnostic)
   main.cpp         CLI driver
   CMakeLists.txt   Project build definitions
@@ -141,6 +149,7 @@ This will build:
 #include "storage/log_manager.h"
 #include "storage/buffer_pool_manager.h"
 #include "index/bplus_tree_engine.h"
+#include "txn/transaction.h"
 
 int main() {
     using namespace dbengine;
@@ -152,10 +161,11 @@ int main() {
     // 2. Instantiate buffer pool with 1,024 frames (4MB cache)
     BufferPoolManager bpm(1024, &disk_manager, &log_manager);
 
-    // 3. Mount the B+Tree engine
-    BPlusTreeEngine db(&bpm);
+    // 3. Mount the B+Tree engine (AUTO runs ARIES-lite recovery on startup
+    //    if the previous shutdown was unclean).
+    BPlusTreeEngine db(&bpm, &log_manager, /*recover_on_open=*/true);
 
-    // 4. Perform Key-Value Operations
+    // 4. Perform Key-Value Operations (auto-transaction per call).
     db.Put("user:1001", "Alice");
     db.Put("user:1002", "Bob");
 
@@ -172,6 +182,13 @@ int main() {
         it->Next();
     }
 
+    // 6. Explicit ACID Transaction with Two-Phase Locking.
+    auto txn = db.BeginTransaction();
+    db.Put(txn.get(), "account:42", "500");
+    db.Get(txn.get(), "account:42", &value);
+    if (db.Commit(txn.get()).ok()) {
+        std::cout << "Committed: account:42 => " << value << "\n";
+    }
     return 0;
 }
 ```
@@ -187,6 +204,34 @@ The test suite validates structural correctness, edge-case splits, checksum inte
 ctest --test-dir build --output-on-failure
 ```
 
+## 🔎 C++ Code Navigation with clangd
+
+The project includes a `.clangd` configuration that uses the CMake compilation
+database in `build/`. Configure the project once after cloning or changing the
+toolchain:
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+```
+
+Install the **clangd** VS Code extension, then reload the window. In a C++
+file, place the cursor on a function or method and use:
+
+* **Go to Definition** (`F12`) to open the implementation.
+* **Go to Declaration** (`Ctrl+F12`) to open the header declaration.
+* **Find All References** (`Shift+F12`) to list semantic callers and uses.
+* **Call Hierarchy** from the context menu to inspect incoming and outgoing
+  calls when the installed C++ language client supports that view.
+
+For example, from `RecoveryManager::Recover`, clangd can navigate to
+`AnalysisPass`, `RedoPass`, and `UndoPass` in `src/txn/recovery_manager.cpp`,
+and from each pass to the corresponding `LogManager` or `RecoveryTarget`
+methods. This is semantic navigation, so overloads and namespace-qualified
+members are distinguished correctly.
+
+If the editor cannot find a symbol, confirm that `build/compile_commands.json`
+exists, reload clangd, and make sure the file is inside this workspace.
+
 Or run individual test suites directly:
 
 ```bash
@@ -196,8 +241,23 @@ Or run individual test suites directly:
 # Test disk allocator, page reads/writes, and file growth
 ./build/tests/test_disk_manager
 
-# Test B+Tree balanced tree depth, splits, and range scans
+# Test B+Tree balanced tree depth, splits, and range scans (direct-disk)
 ./build/tests/test_bplus_tree
+
+# Test BufferPoolManager: cache hit/miss, eviction, write-ahead ordering
+./build/tests/test_buffer_pool_manager
+
+# Test WAL framing, LogRecord codec, and ARIES-lite analysis/redo/undo
+./build/tests/test_wal_recovery
+
+# Test B+Tree operating entirely through the buffer pool + WAL
+./build/tests/test_bpm_bplus_tree
+
+# Test LockManager (shared/exclusive, 2PL) and concurrent transactional workload
+./build/tests/test_transaction_concurrency
+
+# Kill-and-recover: committed txns survive, active and aborted txns are rolled back
+./build/tests/test_crash_recovery
 ```
 
 ### Inspecting On-Disk Structures
@@ -216,6 +276,8 @@ Use the `dump_tree` diagnostic utility to inspect physical page layouts, slot al
 - [x] **Phase 2:** Disk-backed B+Tree engine with free-list space reclamation.
 - [x] **Phase 3.1:** Buffer pool manager with clock-sweep eviction and per-page latches.
 - [x] **Phase 3.2:** Write-Ahead Logging (WAL) with frame checksums and 3-pass ARIES-lite recovery.
+- [x] **Phase 3.3:** Engine hookup — `BPlusTreeEngine` rewired through the buffer pool, emits WAL records on every `Put`/`Delete`, implements `RecoveryTarget` for full crash recovery on startup.
+- [x] **Phase 3.4:** Two-Phase Locking via `LockManager`/`Transaction`, ACID `Begin`/`Commit`/`Abort`, multi-threaded stress test (8 threads × 200 ops) verified clean.
 - [ ] **Phase 4:** Copy-On-Write (COW) B-Tree backend for latch-free snapshot isolation.
 - [ ] **Phase 5:** Log-Structured Merge (LSM) Tree engine with MemTable, SSTables, Bloom filters, and leveled compaction.
 
