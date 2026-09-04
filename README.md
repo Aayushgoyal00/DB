@@ -1,8 +1,38 @@
-# dbengine
+# Slit -- KV Storage Engine
 
-A small C++20, disk-backed key-value database. It stores ordered keys in a
+A disk-backed key-value database. It stores ordered keys in a
 B+ tree and includes slotted pages, a buffer pool, CRC checksums, a write-ahead
 log (WAL), crash recovery, and transaction locking.
+
+## Component structure
+
+```mermaid
+flowchart TD
+	API[KVStore API<br/>Get / Put / Delete / Scan]
+	TREE[BPlusTreeEngine<br/>ordered index and leaf scans]
+	TXN[Transaction + LockManager<br/>shared/exclusive key locks]
+	BPM[BufferPoolManager<br/>cache, pinning, clock replacement]
+	PAGE[Page + SlottedPage<br/>4 KB layout and CRC checksums]
+	DISK[DiskManager<br/>database file]
+	WAL[LogManager + LogRecord<br/>write-ahead log]
+	REC[RecoveryManager<br/>analysis, redo, undo]
+
+	API --> TREE
+	TXN --> TREE
+	TREE --> BPM
+	BPM --> PAGE
+	PAGE --> DISK
+	TREE --> WAL
+	TXN --> WAL
+	BPM -. write-ahead rule .-> WAL
+	WAL --> REC
+	REC --> DISK
+```
+
+`Slit` is a single-node engine: operations enter through the key-value
+API, the B+ tree finds or changes records, the buffer pool manages pages, and
+the disk manager persists them. Transactions add locking and WAL records;
+recovery replays or rolls back WAL data after an unclean shutdown.
 
 ## Features
 
@@ -12,7 +42,7 @@ log (WAL), crash recovery, and transaction locking.
 - Buffer-pool caching with clock replacement and page latches.
 - WAL records with LSNs, before/after images, framing, and CRC validation.
 - ARIES-lite analysis, redo, and undo recovery after an unclean shutdown.
-- Shared/exclusive key locks, two-phase locking, commit, and abort.
+- Shared/exclusive key locks, 2PL two-phase locking, commit, and abort.
 - Read-only tools for viewing the database tree and WAL contents.
 
 ## Requirements
