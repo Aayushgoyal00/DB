@@ -24,10 +24,11 @@ Makefile
 *.db
 dbengine.db
 *.log
-
+*.wal
 # editor / IDE state
 .vscode/
 .idea/
 
 # project-specific downloaded doc
 Database Internals.pdf
+dbengine.wal
