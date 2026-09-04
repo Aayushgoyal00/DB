@@ -41,5 +41,9 @@ target_link_libraries(random_kv_benchmark PRIVATE dbengine_core)
 # Inspect generated DB and WAL files in a readable way.
 add_executable(inspect_demo_files tools/inspect_demo_files.cpp)
 
+# Read-only WAL visualization and validation tool.
+add_executable(dump_wal tools/dump_wal.cpp)
+target_link_libraries(dump_wal PRIVATE dbengine_core)
+
 enable_testing()
 add_subdirectory(tests)

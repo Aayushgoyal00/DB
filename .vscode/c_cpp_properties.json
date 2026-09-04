@@ -3,8 +3,10 @@
     {
       "name": "windows-gcc-x64",
       "includePath": [
+        "${workspaceFolder}/include",
         "${workspaceFolder}/**"
       ],
+      "compileCommands": "${workspaceFolder}/build/compile_commands.json",
       "compilerPath": "C:/msys64/mingw64/bin/gcc.exe",
       "cStandard": "${default}",
       "cppStandard": "${default}",
