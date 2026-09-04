@@ -1,15 +1,11 @@
-# silt — Architecture & Build Plan
+# Silt — Architecture & Build Plan
 
-A from-scratch disk-backed key-value storage engine in C++20, built chapter
+A from-scratch disk-backed key-value storage engine in C++, built chapter
 by chapter through *Database Internals* Part I (Petrov, 2019). This
 document is the complete design reference: what each phase builds, why,
 the exact data structures and APIs involved, how phases connect, and how
 to test each one before moving on.
 
-Chapters 1–4 map to Phases 0–2 (you've read these — this is the "now build
-it" plan). Chapters 5–7 map to Phases 3–5 and are new material to read
-phase-by-phase rather than all at once, for reasons explained in each
-section.
 
 ---
 
@@ -408,14 +404,13 @@ class BufferPoolManager {
   `log_manager_->Flush()` if `page.GetPageLSN() >
   log_manager_->GetFlushedLSN()`. This is the entire WAL correctness
   guarantee — see 7.2.
-- **Refactor pending:** `BPlusTreeEngine` is still wired to
-  `DiskManager` directly from Phase 2. Plumbing the BPM through the
-  tree is the last step of this phase; until then the BPM exists and
-  is unit-testable but the engine still bypasses it on disk access.
+- **Implemented:** `BPlusTreeEngine` uses the buffer pool for page I/O in
+  buffer-pool-backed construction mode. Direct-disk construction remains
+  available for the earlier persistent-engine tests and diagnostics.
 
 ### 7.2 Write-ahead log
-**Status: implemented (LogManager + LogRecord). Engine hookup is
-Phase 3.4 work — the WAL is testable in isolation today.**
+**Status: implemented. `LogManager` and `LogRecord` provide the WAL, and
+`BPlusTreeEngine` emits and uses WAL records in buffer-pool-backed mode.**
 
 ```cpp
 enum class LogRecordType {
@@ -496,10 +491,10 @@ Three passes, run on startup if the last shutdown wasn't clean:
 3. **Undo** — for every txn still in `active_txn_set_`, walk its
    chain backward applying before-images. Rolls back inflight work.
 
-**Engine hookup (Phase 3.4):** `BPlusTreeEngine` will implement
+**Engine hookup (implemented):** `BPlusTreeEngine` implements
 `RecoveryTarget`. Redo re-inserts/applies the after-image on the
 page (using a key → cell lookup); Undo reverts to the before-image.
-Until then `RecoveryManager` is unit-tested with a `MockRecoveryTarget`
+`RecoveryManager` is also unit-tested with a `MockRecoveryTarget`
 that records the call sequence and asserts ordering.
 
 **Limitations / future work:**
@@ -772,10 +767,14 @@ comparable in size to Phase 2 once Phase 3's WAL is reusable.
 
 ---
 
-## 11. What "done" looks like
+## 11. Current definition of done
 
-A `KVStore*`-typed benchmark harness that can point at either
-`BPlusTreeEngine` or `LsmEngine`, run identical workloads against both,
-survive a kill-and-recover cycle on either, and produce the comparison
-numbers described in section 9.7 — backed by a test suite that caught the
-real bugs along the way, not just a demo that worked once.
+The current implementation provides a persistent `BPlusTreeEngine` behind
+the `KVStore` interface. It supports point reads, inserts and updates,
+deletes, ordered scans, buffer-pool-backed I/O, WAL durability, ARIES-lite
+crash recovery, two-phase locking, and concurrent transactional workloads.
+These behaviors are backed by the disk, slotted-page, B+Tree, buffer-pool,
+WAL/recovery, transaction-concurrency, and crash-recovery test suites.
+
+Phase 4 and Phase 5 remain optional future extensions for copy-on-write and
+LSM-tree backends; they are not part of the current completed engine.
