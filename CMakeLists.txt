@@ -45,5 +45,9 @@ add_executable(inspect_demo_files tools/inspect_demo_files.cpp)
 add_executable(dump_wal tools/dump_wal.cpp)
 target_link_libraries(dump_wal PRIVATE dbengine_core)
 
+# Multi-threaded transactional benchmark for an existing database and WAL.
+add_executable(transaction_concurrency_benchmark tools/transaction_concurrency_benchmark.cpp)
+target_link_libraries(transaction_concurrency_benchmark PRIVATE dbengine_core)
+
 enable_testing()
 add_subdirectory(tests)
