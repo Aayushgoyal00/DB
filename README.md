@@ -147,13 +147,45 @@ The concurrency benchmark reports committed/failed operations, throughput,
 final key verification, and B+ tree invariant status. A successful run should
 show `Failed: 0` and `Tree invariants: PASS`.
 
-## C++ API
+### Benchmarks
 
-Include `index/bplus_tree_engine.h` and construct `DiskManager`, `LogManager`,
-`BufferPoolManager`, then `BPlusTreeEngine`. The public key-value interface is
-`Get`, `Put`, `Delete`, and `Scan`; explicit transactions use
-`BeginTransaction`, `Commit`, and `Abort`. See `include/index/` and
-`include/txn/` for declarations.
+Concurrent transaction benchmarks were recorded on a Windows/Git Bash
+development machine. Results are reference measurements and will vary with
+hardware, compiler, build configuration, storage, and system load.
+
+**Headline:** approximately **261 TPS peak** on a 16,000-operation
+transactional UPDATE workload, scaling from 1 to 16 threads before contention
+causes throughput to plateau.
+
+#### Concurrent UPDATE: 16,000 operations, 500 keys
+
+```bash
+build/transaction_update_benchmark.exe benchmark_update.db benchmark_update.wal 16000 500
+```
+
+| Threads | TPS | p50 | p95 | p99 |
+|---:|---:|---:|---:|---:|
+| 1 | 113.76 | 8.44 ms | 12.38 ms | 14.25 ms |
+| 2 | 147.86 | 13.80 ms | 21.57 ms | 25.65 ms |
+| 4 | 228.75 | 13.30 ms | 37.70 ms | 49.22 ms |
+| 8 | 251.37 | 17.41 ms | 83.84 ms | 107.60 ms |
+| 16 | **261.45** | 25.36 ms | 186.46 ms | 247.34 ms |
+| 32 | 220.00 | 51.97 ms | 309.93 ms | 509.81 ms |
+
+Throughput improves through 16 threads, then declines at 32 threads while tail
+latency increases substantially. A shorter 1,000-operation run reached **325.84
+TPS at 32 threads**, illustrating the effect of workload size and run
+conditions on measured throughput.
+
+#### Transaction correctness
+
+```bash
+build/tests/test_transaction_lost_update.exe
+```
+
+Concurrent read-modify-write tests across 1, 2, 4, 8, 16, and 32 threads
+passed both the lost-update and B+ tree invariant checks.
+
 
 ## Scope
 
