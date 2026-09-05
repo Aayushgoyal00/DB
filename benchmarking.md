@@ -241,3 +241,63 @@ Threads            TPS    p50 (ms)    p95 (ms)    p99 (ms)      Failed
 
 aayus@Xiaomi_Book MINGW64 /e/software ideas/DB (main)
 $ 
+
+
+
+
+aayus@Xiaomi_Book MINGW64 /e/software ideas/DB (main)
+$ ./build/tests/test_transaction_lost_update.exe
+Lost-update correctness check
+Total operations per configuration: 2000
+Timeout per configuration: 60s
+Heartbeat interval: 5s
+
+Variant A-single-counter
+Running 1 threads...
+A-single-counter / 1 threads: PASS (elapsed 1.73s, committed 2000, failed 0, completed 2000/2000)
+Running 2 threads...
+A-single-counter / 2 threads: PASS (elapsed 1.62s, committed 2000, failed 0, completed 2000/2000)
+Running 4 threads...
+A-single-counter / 4 threads: PASS (elapsed 1.64s, committed 2000, failed 0, completed 2000/2000)
+Running 8 threads...
+A-single-counter / 8 threads: PASS (elapsed 1.81s, committed 2000, failed 0, completed 2000/2000)
+Running 16 threads...
+A-single-counter / 16 threads: PASS (elapsed 1.81s, committed 2000, failed 0, completed 2000/2000)
+Running 32 threads...
+A-single-counter / 32 threads: PASS (elapsed 1.69s, committed 1984, failed 0, completed 1984/2000)
+
+Variant B-multiple-counters
+Running 1 threads...
+B-multiple-counters / 1 threads: PASS (elapsed 3.39s, committed 2000, failed 0, completed 2000/2000)
+Running 2 threads...
+B-multiple-counters / 2 threads: PASS (elapsed 3.46s, committed 2000, failed 0, completed 2000/2000)
+Running 4 threads...
+B-multiple-counters / 4 threads: PASS (elapsed 3.45s, committed 2000, failed 0, completed 2000/2000)
+Running 8 threads...
+B-multiple-counters / 8 threads: PASS (elapsed 4.12s, committed 2000, failed 0, completed 2000/2000)
+Running 16 threads...
+B-multiple-counters / 16 threads: PASS (elapsed 3.96s, committed 2000, failed 0, completed 2000/2000)
+Running 32 threads...
+B-multiple-counters / 32 threads: PASS (elapsed 3.51s, committed 1984, failed 0, completed 1984/2000)
+
+
+============================================================
+Variant               Threads  Lost-update             Invariants        Elapsed(s)  
+------------------------------------------------------------
+A-single-counter      1        PASS                    PASS              1.73        
+A-single-counter      2        PASS                    PASS              1.62        
+A-single-counter      4        PASS                    PASS              1.64        
+A-single-counter      8        PASS                    PASS              1.81        
+A-single-counter      16       PASS                    PASS              1.81        
+A-single-counter      32       PASS                    PASS              1.69        
+B-multiple-counters   1        PASS                    PASS              3.39        
+B-multiple-counters   2        PASS                    PASS              3.46        
+B-multiple-counters   4        PASS                    PASS              3.45        
+B-multiple-counters   8        PASS                    PASS              4.12        
+B-multiple-counters   16       PASS                    PASS              3.96        
+B-multiple-counters   32       PASS                    PASS              3.51        
+============================================================
+
+aayus@Xiaomi_Book MINGW64 /e/software ideas/DB (main)
+$ 
+

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -119,6 +120,7 @@ class BPlusTreeEngine : public KVStore, public RecoveryTarget {
   BufferPoolManager* bpm_ = nullptr;
   LogManager* log_manager_ = nullptr;
   LockManager lock_manager_;
+  std::mutex mutation_latch_;
 
   page_id_t root_page_id_ = INVALID_PAGE_ID;
   Status initialization_status_;

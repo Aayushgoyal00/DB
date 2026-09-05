@@ -75,7 +75,15 @@ Status LockManager::AcquireExclusive(Transaction* txn, const std::string& key) {
   std::list<LockRequest>::iterator req_it;
 
   if (upgrading) {
-    // Find and modify the existing shared request
+    // Do not wait while retaining a shared lock: two shared holders that both
+    // wait for an upgrade would otherwise deadlock each other permanently.
+    if (head->shared_count != 1 ||
+        head->shared_txn_ids.count(txn->GetTxnId()) == 0) {
+      return Status::InvalidArgument(
+          "lock upgrade conflicts with another shared holder; abort transaction");
+    }
+
+    // Convert the caller's existing request in place.
     for (auto it = head->request_queue.begin(); it != head->request_queue.end(); ++it) {
       if (it->txn_id == txn->GetTxnId() && it->lock_mode == LockMode::kShared) {
         it->lock_mode = LockMode::kExclusive;
@@ -83,27 +91,19 @@ Status LockManager::AcquireExclusive(Transaction* txn, const std::string& key) {
         break;
       }
     }
+    head->shared_count--;
+    head->shared_txn_ids.erase(txn->GetTxnId());
+    txn->RemoveSharedLock(key);
   } else {
     head->request_queue.push_back({txn->GetTxnId(), LockMode::kExclusive, false});
     req_it = std::prev(head->request_queue.end());
   }
 
   head->cv.wait(lock, [&]() {
-    if (upgrading) {
-      // Must be the only shared holder and no writer.
-      return !head->is_writing && head->shared_count == 1 &&
-             head->shared_txn_ids.count(txn->GetTxnId()) == 1;
-    }
     // Exclusive can be granted only if first in queue, not writing, and no readers.
     return !head->is_writing && head->shared_count == 0 &&
            head->request_queue.begin() == req_it;
   });
-
-  if (upgrading) {
-    head->shared_count--;
-    head->shared_txn_ids.erase(txn->GetTxnId());
-    txn->RemoveSharedLock(key);
-  }
 
   req_it->granted = true;
   head->is_writing = true;

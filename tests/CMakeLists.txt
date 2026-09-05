@@ -33,3 +33,7 @@ add_test(NAME TransactionConcurrencyTest COMMAND test_transaction_concurrency)
 add_executable(test_crash_recovery test_crash_recovery.cpp)
 target_link_libraries(test_crash_recovery PRIVATE dbengine_core)
 add_test(NAME CrashRecoveryTest COMMAND test_crash_recovery)
+
+add_executable(test_transaction_lost_update test_transaction_lost_update.cpp)
+target_link_libraries(test_transaction_lost_update PRIVATE dbengine_core)
+add_test(NAME TransactionLostUpdateTest COMMAND test_transaction_lost_update)

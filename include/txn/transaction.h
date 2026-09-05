@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -86,6 +88,21 @@ class Transaction {
     undo_records_.clear();
   }
 
+  void AcquireMutationLock(std::mutex* mutex) {
+    mutation_lock_ = std::make_unique<std::unique_lock<std::mutex>>(*mutex);
+  }
+
+  bool HoldsMutationLock() const {
+    return mutation_lock_ != nullptr && mutation_lock_->owns_lock();
+  }
+
+  void ReleaseMutationLock() {
+    if (mutation_lock_ != nullptr) {
+      mutation_lock_->unlock();
+      mutation_lock_.reset();
+    }
+  }
+
  private:
   txn_id_t txn_id_;
   TransactionState state_ = TransactionState::kGrowing;
@@ -94,6 +111,7 @@ class Transaction {
   std::unordered_set<std::string> shared_lock_set_;
   std::unordered_set<std::string> exclusive_lock_set_;
   std::vector<UndoRecord> undo_records_;
+  std::unique_ptr<std::unique_lock<std::mutex>> mutation_lock_;
 };
 
 }  // namespace dbengine

@@ -850,6 +850,9 @@ std::unique_ptr<Transaction> BPlusTreeEngine::BeginTransaction() {
 
 Status BPlusTreeEngine::Get(Transaction* txn, const std::string& key, std::string* value_out) {
   if (txn != nullptr) {
+    if (!txn->HoldsMutationLock()) {
+      txn->AcquireMutationLock(&mutation_latch_);
+    }
     Status s = lock_manager_.AcquireShared(txn, key);
     if (!s.ok()) return s;
   }
@@ -858,6 +861,9 @@ Status BPlusTreeEngine::Get(Transaction* txn, const std::string& key, std::strin
 
 Status BPlusTreeEngine::Put(Transaction* txn, const std::string& key, const std::string& value) {
   if (txn != nullptr) {
+    if (!txn->HoldsMutationLock()) {
+      txn->AcquireMutationLock(&mutation_latch_);
+    }
     Status s = lock_manager_.AcquireExclusive(txn, key);
     if (!s.ok()) return s;
 
@@ -921,6 +927,7 @@ Status BPlusTreeEngine::Commit(Transaction* txn) {
     if (!as.ok()) return as;
   }
   lock_manager_.ReleaseAll(txn);
+  txn->ReleaseMutationLock();
   txn->SetState(TransactionState::kCommitted);
   txn->ClearUndoRecords();
   return Status::OK();
@@ -949,6 +956,7 @@ Status BPlusTreeEngine::Abort(Transaction* txn) {
     log_manager_->AppendAndFlush(&rec);
   }
   lock_manager_.ReleaseAll(txn);
+  txn->ReleaseMutationLock();
   txn->SetState(TransactionState::kAborted);
   txn->ClearUndoRecords();
   return Status::OK();
