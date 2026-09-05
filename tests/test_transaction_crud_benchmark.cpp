@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -133,7 +134,7 @@ bool CreateInitialDatabase(
       true);
 
   /*
-   * Start with exactly 500 existing keys.
+   * Start with exactly key_count existing keys.
    */
   for (int key_number = 1;
        key_number <= key_count;
@@ -172,7 +173,51 @@ bool CreateInitialDatabase(
   return true;
 }
 
+bool CopySeedFiles(
+    const std::string& seed_db_file,
+    const std::string& seed_wal_file,
+    const std::string& db_file,
+    const std::string& wal_file) {
+
+  namespace fs = std::filesystem;
+
+  std::error_code ec;
+
+  fs::remove(db_file, ec);
+  fs::remove(wal_file, ec);
+
+  fs::copy_file(
+      seed_db_file,
+      db_file,
+      fs::copy_options::overwrite_existing,
+      ec);
+
+  if (ec) {
+    std::cerr
+        << "Failed to copy seed db: "
+        << ec.message() << "\n";
+    return false;
+  }
+
+  fs::copy_file(
+      seed_wal_file,
+      wal_file,
+      fs::copy_options::overwrite_existing,
+      ec);
+
+  if (ec) {
+    std::cerr
+        << "Failed to copy seed wal: "
+        << ec.message() << "\n";
+    return false;
+  }
+
+  return true;
+}
+
 BenchmarkResult RunBenchmark(
+    const std::string& seed_db_file,
+    const std::string& seed_wal_file,
     const std::string& db_file,
     const std::string& wal_file,
     int thread_count,
@@ -180,23 +225,20 @@ BenchmarkResult RunBenchmark(
     int key_count) {
 
   /*
-   * Fresh database for every concurrency level.
+   * Every thread-count level starts from an identical,
+   * freshly-populated database — but instead of
+   * re-running key_count inserts (and their fsync'd
+   * commits) on every iteration, we copy the already-built
+   * seed files.
    */
-  if (std::remove(db_file.c_str()) != 0) {
-    // File may not exist.
-  }
-
-  if (std::remove(wal_file.c_str()) != 0) {
-    // File may not exist.
-  }
-
-  if (!CreateInitialDatabase(
+  if (!CopySeedFiles(
+          seed_db_file,
+          seed_wal_file,
           db_file,
-          wal_file,
-          key_count)) {
+          wal_file)) {
 
     std::cerr
-        << "Failed to initialize database\n";
+        << "Failed to prepare database from seed\n";
 
     return {};
   }
@@ -248,7 +290,7 @@ BenchmarkResult RunBenchmark(
             /*
              * Keep all workload keys in:
              *
-             * user:1 -> user:500
+             * user:1 -> user:<key_count>
              */
             const int key_number =
                 (thread_id + operation) %
@@ -481,54 +523,94 @@ int main(int argc, char** argv) {
           ? argv[2]
           : "benchmark_crud.wal";
 
-  const int operations_per_thread =
+  /*
+   * Fixed total, not ops-per-thread — see the update
+   * benchmark for the full explanation. Every thread-count
+   * configuration below runs exactly this many total
+   * transactions, split evenly across the workers.
+   */
+  const int total_operations =
       argc > 3
           ? std::atoi(argv[3])
-          : 1000;
+          : 16000;
 
   const int key_count =
       argc > 4
           ? std::atoi(argv[4])
           : 500;
 
-  if (operations_per_thread <= 0 ||
+  if (total_operations <= 0 ||
       key_count <= 0 ||
-      key_count > 500) {
+      key_count > 200000) {
 
     std::cerr
         << "Usage:\n"
         << "  transaction_crud_benchmark "
         << "[db] [wal] "
-        << "[ops_per_thread] "
-        << "[key_count]\n";
+        << "[total_operations] "
+        << "[key_count]\n"
+        << "key_count must be between 1 and 200000\n";
 
     return 1;
   }
 
   const std::vector<int> thread_counts = {
-      1, 2, 4, 8, 16
+      1, 2, 4, 8, 16, 32
   };
+
+  const std::string seed_db_file = db_file + ".seed";
+  const std::string seed_wal_file = wal_file + ".seed";
 
   std::cout
       << "\nTransaction CRUD concurrency benchmark\n"
-      << "Operations per thread: "
-      << operations_per_thread << "\n"
+      << "Total operations per thread-count: "
+      << total_operations << "\n"
       << "Keys: 1-" << key_count << "\n"
       << "Workload: UPDATE / DELETE / UPSERT\n\n";
+
+  std::cout
+      << "Building seed database ("
+      << key_count
+      << " keys, once)...\n";
+
+  std::remove(seed_db_file.c_str());
+  std::remove(seed_wal_file.c_str());
+
+  if (!CreateInitialDatabase(
+          seed_db_file,
+          seed_wal_file,
+          key_count)) {
+
+    std::cerr
+        << "Failed to build seed database\n";
+
+    return 1;
+  }
+
+  std::cout << "Seed database ready.\n\n";
 
   std::vector<BenchmarkResult> results;
 
   for (int threads : thread_counts) {
+
+    const int operations_per_thread =
+        total_operations / threads;
 
     std::cout
         << "Testing "
         << threads
         << " thread"
         << (threads == 1 ? "" : "s")
-        << "...\n";
+        << " ("
+        << operations_per_thread
+        << " ops/thread, "
+        << operations_per_thread * threads
+        << " total)...\n";
 
     BenchmarkResult result =
         RunBenchmark(
+            seed_db_file,
+            seed_wal_file,
             db_file,
             wal_file,
             threads,

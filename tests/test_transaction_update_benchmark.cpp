@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -118,7 +119,7 @@ bool CreateInitialDatabase(
    * user:1
    * user:2
    * ...
-   * user:500
+   * user:<key_count>
    *
    * These keys will already exist when the
    * concurrency benchmark starts.
@@ -160,7 +161,56 @@ bool CreateInitialDatabase(
   return true;
 }
 
+bool CopySeedFiles(
+    const std::string& seed_db_file,
+    const std::string& seed_wal_file,
+    const std::string& db_file,
+    const std::string& wal_file) {
+
+  namespace fs = std::filesystem;
+
+  std::error_code ec;
+
+  /*
+   * Wipe any leftover working files from a previous
+   * thread-count iteration before copying the seed
+   * back in.
+   */
+  fs::remove(db_file, ec);
+  fs::remove(wal_file, ec);
+
+  fs::copy_file(
+      seed_db_file,
+      db_file,
+      fs::copy_options::overwrite_existing,
+      ec);
+
+  if (ec) {
+    std::cerr
+        << "Failed to copy seed db: "
+        << ec.message() << "\n";
+    return false;
+  }
+
+  fs::copy_file(
+      seed_wal_file,
+      wal_file,
+      fs::copy_options::overwrite_existing,
+      ec);
+
+  if (ec) {
+    std::cerr
+        << "Failed to copy seed wal: "
+        << ec.message() << "\n";
+    return false;
+  }
+
+  return true;
+}
+
 BenchmarkResult RunBenchmark(
+    const std::string& seed_db_file,
+    const std::string& seed_wal_file,
     const std::string& db_file,
     const std::string& wal_file,
     int thread_count,
@@ -170,24 +220,22 @@ BenchmarkResult RunBenchmark(
   /*
    * IMPORTANT:
    *
-   * Create a completely fresh database for
-   * every thread-count test.
+   * Every thread-count test still starts from an
+   * identical, freshly-populated database — but instead
+   * of re-running key_count inserts (and their fsync'd
+   * commits) on every single iteration, we just copy the
+   * already-built seed files. Six thread-count runs used
+   * to mean six full re-population passes; now it's one
+   * population pass plus six cheap file copies.
    */
-  if (std::remove(db_file.c_str()) != 0) {
-    // File may simply not exist.
-  }
-
-  if (std::remove(wal_file.c_str()) != 0) {
-    // File may simply not exist.
-  }
-
-  if (!CreateInitialDatabase(
+  if (!CopySeedFiles(
+          seed_db_file,
+          seed_wal_file,
           db_file,
-          wal_file,
-          key_count)) {
+          wal_file)) {
 
     std::cerr
-        << "Failed to create initial database\n";
+        << "Failed to prepare database from seed\n";
 
     return {};
   }
@@ -240,7 +288,7 @@ BenchmarkResult RunBenchmark(
                ++operation) {
 
             /*
-             * ONLY keys 1-500.
+             * ONLY keys 1-key_count.
              */
             const int key_number =
                 (thread_id + operation) %
@@ -265,8 +313,8 @@ BenchmarkResult RunBenchmark(
 
             /*
              * Because the database was initialized
-             * with all 500 keys, this Put() should
-             * exercise the UPDATE path.
+             * with all key_count keys, this Put()
+             * should exercise the UPDATE path.
              */
             const auto put_status =
                 engine.Put(
@@ -389,53 +437,103 @@ int main(int argc, char** argv) {
           ? argv[2]
           : "benchmark_update.wal";
 
-  const int operations_per_thread =
+  /*
+   * This is now a FIXED TOTAL, not ops-per-thread.
+   * Every thread-count configuration below executes
+   * exactly this many transactions in total, split
+   * evenly across however many worker threads are
+   * running. That keeps "how much work is done" constant
+   * while only concurrency varies, which is what makes
+   * TPS across different thread counts comparable.
+   */
+  const int total_operations =
       argc > 3
           ? std::atoi(argv[3])
-          : 1000;
+          : 16000;
 
   const int key_count =
       argc > 4
           ? std::atoi(argv[4])
           : 500;
 
-  if (operations_per_thread <= 0 ||
+  if (total_operations <= 0 ||
       key_count <= 0 ||
-      key_count > 500) {
+      key_count > 200000) {
 
     std::cerr
         << "Usage:\n"
         << "  transaction_update_benchmark "
         << "[db] [wal] "
-        << "[ops_per_thread] "
-        << "[key_count]\n";
+        << "[total_operations] "
+        << "[key_count]\n"
+        << "key_count must be between 1 and 200000\n";
 
     return 1;
   }
 
   const std::vector<int> thread_counts = {
-      1, 2, 4, 8, 16
+      1, 2, 4, 8, 16, 32
   };
+
+  const std::string seed_db_file = db_file + ".seed";
+  const std::string seed_wal_file = wal_file + ".seed";
 
   std::cout
       << "\nConcurrent UPDATE benchmark\n"
-      << "Operations per thread: "
-      << operations_per_thread << "\n"
+      << "Total operations per thread-count: "
+      << total_operations << "\n"
       << "Keys: 1-" << key_count << "\n\n";
+
+  std::cout
+      << "Building seed database ("
+      << key_count
+      << " keys, once)...\n";
+
+  std::remove(seed_db_file.c_str());
+  std::remove(seed_wal_file.c_str());
+
+  if (!CreateInitialDatabase(
+          seed_db_file,
+          seed_wal_file,
+          key_count)) {
+
+    std::cerr
+        << "Failed to build seed database\n";
+
+    return 1;
+  }
+
+  std::cout << "Seed database ready.\n\n";
 
   std::vector<BenchmarkResult> results;
 
   for (int threads : thread_counts) {
+
+    /*
+     * Fixed total, split evenly. Integer division means
+     * a small remainder (total_operations % threads) is
+     * dropped rather than executed, which keeps every
+     * thread's workload identical; the effect on total
+     * ops is negligible at these scales.
+     */
+    const int operations_per_thread =
+        total_operations / threads;
 
     std::cout
         << "Testing "
         << threads
         << " thread"
         << (threads == 1 ? "" : "s")
-        << "...\n";
+        << " ("
+        << operations_per_thread
+        << " ops/thread, "
+        << operations_per_thread * threads
+        << " total)...\n";
 
     BenchmarkResult result =
         RunBenchmark(
+            seed_db_file,
+            seed_wal_file,
             db_file,
             wal_file,
             threads,
