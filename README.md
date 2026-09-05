@@ -5,40 +5,8 @@ B+ tree and includes slotted pages, a buffer pool, CRC checksums, a write-ahead
 log (WAL), crash recovery, and transaction locking.
 
 
-## Current component graph
+![Architecture](ArchiFlow.png)
 
-```mermaid
-flowchart TD
-    CLI[dbengine CLI]
-    API[KVStore API\nGet / Put / Delete / Scan]
-    TXN[Transactions\n2PL + LockManager]
-    TREE[BPlusTreeEngine\nsearch, splits, scans]
-    BPM[BufferPoolManager\ncache, pinning, eviction]
-    PAGE[Page + SlottedPage\n4 KB records + CRC]
-    DISK[DiskManager\ndb file]
-    WAL[LogManager + LogRecord\nWAL file]
-    REC[RecoveryManager\nanalysis, redo, undo]
-    TOOLS[Diagnostic tools\ndump_tree / dump_wal]
-
-    CLI --> API
-    API --> TREE
-    TXN --> TREE
-    TREE --> BPM
-    BPM --> PAGE
-    PAGE --> DISK
-    TREE --> WAL
-    TXN --> WAL
-    BPM -. write-ahead rule .-> WAL
-    WAL --> REC
-    REC --> TREE
-    TOOLS -. read-only inspection .-> DISK
-    TOOLS -. read-only inspection .-> WAL
-```
-
-`Slit` is a single-node engine: operations enter through the key-value
-API, the B+ tree finds or changes records, the buffer pool manages pages, and
-the disk manager persists them. Transactions add locking and WAL records;
-recovery replays or rolls back WAL data after an unclean shutdown.
 
 ## Features
 
