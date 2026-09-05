@@ -49,5 +49,17 @@ target_link_libraries(dump_wal PRIVATE dbengine_core)
 add_executable(transaction_concurrency_benchmark tools/transaction_concurrency_benchmark.cpp)
 target_link_libraries(transaction_concurrency_benchmark PRIVATE dbengine_core)
 
+# Transaction concurrency scaling benchmark for an existing database and WAL.
+add_executable(transaction_scaling_benchmark tests/test_transaction_scaling_benchmark.cpp)
+target_link_libraries(transaction_scaling_benchmark PRIVATE dbengine_core)
+
+# Transaction update benchmark for an existing database and WAL.
+add_executable(transaction_update_benchmark tests/test_transaction_update_benchmark.cpp)
+target_link_libraries(transaction_update_benchmark PRIVATE dbengine_core)
+
+# Transaction CRUD benchmark for an existing database and WAL.
+add_executable(transaction_crud_benchmark tests/test_transaction_crud_benchmark.cpp)
+target_link_libraries(transaction_crud_benchmark PRIVATE dbengine_core)
+
 enable_testing()
 add_subdirectory(tests)
