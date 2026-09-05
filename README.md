@@ -1,4 +1,4 @@
-# Slit -- KV Storage Engine
+# Silt -- KV Storage Engine
 
 A disk-backed key-value database. It stores ordered keys in a
 B+ tree and includes slotted pages, a buffer pool, CRC checksums, a write-ahead
